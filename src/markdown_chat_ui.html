@@ -24,6 +24,8 @@ h1 { display:flex; align-items:center; flex-wrap:wrap; gap:9px; font-size:15px; 
 .presence-symbol { width:14px; height:14px; flex:none; }
 #tool-total { color:var(--muted); font-size:11px; font-weight:400; white-space:nowrap; font-variant-numeric:tabular-nums; }
 .subtitle { font-size:12px; color:var(--muted); }
+.auto-continue { flex:none; border:1px solid var(--border); border-radius:14px; padding:5px 9px; background:transparent; color:var(--muted); font-size:11px; }
+.auto-continue[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); background:color-mix(in srgb, var(--accent) 9%, transparent); }
 .icon-button { width:34px; height:34px; padding:6px; border:0; background:transparent; color:var(--muted); border-radius:50%; }
 svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round; }
 #messages { overflow:auto; overscroll-behavior:contain; max-height:480px; min-height:130px; padding:16px; display:flex; flex-direction:column; gap:12px; scrollbar-width:thin; }
@@ -71,6 +73,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 <section id="chat" aria-label="Markdown chat for this conversation">
   <header class="header">
     <div class="heading"><h1>Agent <span id="presence" role="status"></span><span id="tool-total" hidden></span></h1><div class="subtitle">Markdown chat · This conversation only</div></div>
+    <button id="auto-continue" class="auto-continue" type="button" aria-pressed="false" title="Automatically send a continuation prompt after the agent becomes idle">Auto</button>
     <button id="collapse" class="icon-button" aria-label="Collapse chat" aria-expanded="true" title="Collapse chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
   </header>
   <div id="panel">
@@ -94,6 +97,10 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   "use strict";
   function mountChat(scope, bridge = null) {
   const META = "io.github.devnoname120/codexify/markdown-chat";
+  const AUTO_CONTINUE_IDLE_MS = 5 * 60 * 1000;
+  const AUTO_CONTINUE_WINDOW_MS = 8 * 60 * 60 * 1000;
+  const AUTO_CONTINUE_MAX = 24;
+  const AUTO_CONTINUE_PROMPT = "Continue the current task from the existing Codexify workspace, saved plan, and current files. Do not restart completed work. Keep working independently from where the previous turn stopped. If the task is already complete, report that and stop without making unnecessary changes.";
   const el = id => scope.getElementById(id);
   const list = el("messages"), input = el("draft"), send = el("send"), older = el("older");
   const records = new Map(), nodes = new Map(), markerNodes = new Map(), pendingSends = new Map(), rpcPending = new Map();
@@ -102,12 +109,17 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   let revision = null, before = null, hasMore = false, delivered = 0, readThrough = 0, chatFile = null, failures = 0, snapshotEnd = 0;
   let lastAgentCall = null, totalToolCalls = null, clockOffset = 0, presenceTimer = null;
   let messageClockTimer = null;
+  let autoContinueTimer = null, autoContinueBusy = false;
   let hostCapabilities = {};
   let statusKind = "normal";
   let available = bridge === null;
   const saved = (bridge?.getState?.() || window.openai?.widgetState)?.privateContent || {};
   input.value = typeof saved.draft === "string" ? saved.draft : "";
   collapsed = saved.collapsed === true;
+  let autoContinue = saved.autoContinue === true;
+  let autoContinueUntil = Number.isSafeInteger(saved.autoContinueUntil) ? saved.autoContinueUntil : null;
+  let autoContinueCount = Number.isSafeInteger(saved.autoContinueCount) ? saved.autoContinueCount : 0;
+  let autoContinueLastToolCalls = Number.isSafeInteger(saved.autoContinueLastToolCalls) ? saved.autoContinueLastToolCalls : null;
   for (const message of Array.isArray(saved.pending) ? saved.pending : []) {
     if (typeof message.id === "string" && typeof message.markdown === "string") {
       pendingSends.set(message.id, { ...message, failed:true, pending:false });
@@ -174,10 +186,25 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     if (!payload) throw new Error("The connector returned no chat widget data. Refresh the connector tools.");
     return payload;
   }
+  async function followUp(prompt) {
+    if (tornDown) throw new Error("This widget has closed.");
+    if (bridge?.sendFollowUpMessage) return bridge.sendFollowUpMessage(prompt);
+    if (typeof window.openai?.sendFollowUpMessage === "function") {
+      const result = await window.openai.sendFollowUpMessage({ prompt, scrollToBottom:true });
+      if (result && (result.isError === true || result.is_error === true)) throw new Error("The host rejected the continuation message.");
+      return result;
+    }
+    if (initialized) {
+      const result = await rpc("ui/message", { role:"user", content:[{ type:"text", text:prompt }] });
+      if (result && (result.isError === true || result.is_error === true)) throw new Error("The host rejected the continuation message.");
+      return result;
+    }
+    throw new Error("This host does not expose follow-up messages.");
+  }
   function save() {
     clearTimeout(saveTimer);
     const current = (bridge?.getState?.() || window.openai?.widgetState)?.privateContent || {};
-    const state = { privateContent:{ ...current, draft:input.value, collapsed, pending:[...pendingSends.values()] } };
+    const state = { privateContent:{ ...current, draft:input.value, collapsed, pending:[...pendingSends.values()], autoContinue, autoContinueUntil, autoContinueCount, autoContinueLastToolCalls } };
     try {
       if (bridge?.setState) bridge.setState(state);
       else Promise.resolve(window.openai?.setWidgetState?.(state)).catch(() => {});
@@ -246,6 +273,44 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     node.querySelector(".presence-label").textContent = label;
     node.title = lastAgentCall === null ? "No agent tool call recorded for this conversation." : "Based on this conversation's last agent tool call, not a live connection or proof of ongoing work.";
     if (!tornDown && !document.hidden && delay !== null) presenceTimer = setTimeout(updatePresence, Math.max(1, delay));
+  }
+  function updateAutoContinue() {
+    const node = el("auto-continue");
+    node.setAttribute("aria-pressed", String(autoContinue));
+    node.textContent = autoContinue ? `Auto ${autoContinueCount}/${AUTO_CONTINUE_MAX}` : "Auto";
+    node.title = autoContinue
+      ? "Auto-continue is on for up to 8 hours. It sends a new ChatGPT turn after 5 minutes without an agent tool call."
+      : "Automatically continue after the current ChatGPT turn stops. Bounded to 8 hours / 24 continuations.";
+  }
+  function maybeAutoContinue() {
+    clearTimeout(autoContinueTimer);
+    if (!autoContinue || autoContinueBusy || !available || tornDown) return;
+    const now = Date.now();
+    if (!Number.isSafeInteger(autoContinueUntil) || now >= autoContinueUntil || autoContinueCount >= AUTO_CONTINUE_MAX) {
+      autoContinue = false; autoContinueUntil = null; save(); updateAutoContinue();
+      status("Auto-continue stopped: its safety limit was reached.");
+      return;
+    }
+    if (!Number.isFinite(lastAgentCall) || !Number.isSafeInteger(totalToolCalls)) return;
+    if (autoContinueLastToolCalls === totalToolCalls) return;
+    const due = lastAgentCall - clockOffset + AUTO_CONTINUE_IDLE_MS;
+    if (now < due) {
+      autoContinueTimer = setTimeout(maybeAutoContinue, Math.max(1, Math.min(due - now, autoContinueUntil - now)));
+      return;
+    }
+    autoContinueBusy = true;
+    autoContinueLastToolCalls = totalToolCalls;
+    save(); updateAutoContinue();
+    void followUp(AUTO_CONTINUE_PROMPT).then(() => {
+      autoContinueCount += 1;
+      save(); updateAutoContinue();
+      status(`Auto-continue sent continuation ${autoContinueCount}/${AUTO_CONTINUE_MAX}.`);
+    }).catch(error => {
+      autoContinueLastToolCalls = null;
+      save();
+      status(error.message || "Auto-continue could not send a continuation.", true);
+      autoContinueTimer = setTimeout(maybeAutoContinue, 60_000);
+    }).finally(() => { autoContinueBusy = false; });
   }
   function markdown(container, text) {
     window.renderCodexifyMarkdown(container, text, {
@@ -384,6 +449,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       updateToolTotal();
       if (Number.isSafeInteger(page.server_time_ms)) clockOffset = page.server_time_ms - Date.now();
       updatePresence();
+      maybeAutoContinue();
     }
     if (!history) revision = page.revision;
     if (!page.unchanged) {
@@ -402,11 +468,12 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   }
   function schedule() {
     clearTimeout(pollTimer);
-    if (!available || tornDown || collapsed || !visible || document.hidden) return;
-    pollTimer = setTimeout(() => { void refresh(); }, failures ? Math.min(30000, 2000 * 2 ** failures) : 2000);
+    if (!available || tornDown || (!autoContinue && (collapsed || !visible || document.hidden))) return;
+    const idlePoll = autoContinue && (collapsed || !visible || document.hidden) ? 10000 : 2000;
+    pollTimer = setTimeout(() => { void refresh(); }, failures ? Math.min(30000, idlePoll * 2 ** failures) : idlePoll);
   }
   async function refresh() {
-    if (!available || refreshing || tornDown || collapsed || !visible || document.hidden) return;
+    if (!available || refreshing || tornDown || (!autoContinue && (collapsed || !visible || document.hidden))) return;
     refreshing = true;
     try {
       applyPage(await call("chat_ui_state", revision ? { revision } : {})); failures = 0;
@@ -457,9 +524,23 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     save(); schedule(); size();
   }
   el("collapse").addEventListener("click", () => { collapsed = !collapsed; setCollapsed(); if (!collapsed) { render(); void refresh(); } });
+  el("auto-continue").addEventListener("click", () => {
+    autoContinue = !autoContinue;
+    if (autoContinue) {
+      autoContinueUntil = Date.now() + AUTO_CONTINUE_WINDOW_MS;
+      autoContinueCount = 0;
+      autoContinueLastToolCalls = null;
+      status("Auto-continue enabled for up to 8 hours / 24 continuations.");
+    } else {
+      autoContinueUntil = null;
+      clearTimeout(autoContinueTimer);
+      status("Auto-continue disabled.");
+    }
+    save(); updateAutoContinue(); maybeAutoContinue(); schedule();
+  });
   el("refresh").addEventListener("click", () => { revision = null; void refresh(); });
   function teardown() {
-    tornDown = true; clearTimeout(pollTimer); clearTimeout(saveTimer); clearTimeout(presenceTimer); clearTimeout(messageClockTimer);
+    tornDown = true; clearTimeout(pollTimer); clearTimeout(saveTimer); clearTimeout(presenceTimer); clearTimeout(messageClockTimer); clearTimeout(autoContinueTimer);
     for (const waiter of rpcPending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error("Widget closed.")); }
     rpcPending.clear();
     window.removeEventListener("message", onMessage);
@@ -485,7 +566,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     }
   }
   function onFocus() { render(); void refresh(); }
-  function onVisibility() { updatePresence(); render(); schedule(); if (!document.hidden) void refresh(); }
+  function onVisibility() { updatePresence(); render(); schedule(); maybeAutoContinue(); if (!document.hidden) void refresh(); }
   window.addEventListener("message", onMessage);
   window.addEventListener("openai:set_globals", onGlobals);
   window.addEventListener("focus", onFocus);
@@ -499,7 +580,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   const resize = typeof ResizeObserver === "function" ? new ResizeObserver(size) : null;
   intersection?.observe(el("chat"));
   resize?.observe(el("chat"));
-  theme(window.openai); setCollapsed(); render(); resizeInput(); updatePresence(); updateToolTotal();
+  theme(window.openai); setCollapsed(); render(); resizeInput(); updatePresence(); updateToolTotal(); updateAutoContinue(); maybeAutoContinue();
   if (!bridge) rpc("ui/initialize", { appInfo:{ name:"Codexify Markdown chat", version:"1" }, protocolVersion:"2026-01-26", appCapabilities:{} }, 5000)
     .then(result => { initialized = true; hostCapabilities = result?.hostCapabilities || {}; theme(result?.hostContext); post({ method:"ui/notifications/initialized", params:{} }); if (!chatFile) void refresh(); size(); })
     .catch(() => { if (!window.openai?.callTool) status("This host has not connected the chat widget.", true); });
@@ -508,9 +589,9 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     setAvailable(value) {
       const changed = available !== value;
       available = value;
-      if (!value) { clearTimeout(pollTimer); clearTimeout(messageClockTimer); totalToolCalls = null; updateToolTotal(); el("empty").textContent = "Select a workspace above to start this conversation's chat."; }
+      if (!value) { clearTimeout(pollTimer); clearTimeout(messageClockTimer); clearTimeout(autoContinueTimer); totalToolCalls = null; updateToolTotal(); el("empty").textContent = "Select a workspace above to start this conversation's chat."; }
       resizeInput();
-      if (changed && value) { revision = null; void refresh(); }
+      if (changed && value) { revision = null; void refresh(); maybeAutoContinue(); }
     },
     setTheme:theme,
     close() { teardown(); intersection?.disconnect(); resize?.disconnect(); }

@@ -678,7 +678,7 @@ dialog.refresh-popover::backdrop { background:rgb(0 0 0 / .48); }
       const scope = chatHost.attachShadow({ mode:"open" });
       scope.append(template.content.cloneNode(true));
       root.after(chatHost);
-      chatController = window.mountCodexifyChat(scope, { callTool, openLink, downloadFile, reportSize:scheduleSizeReport });
+      chatController = window.mountCodexifyChat(scope, { callTool, sendFollowUpMessage, openLink, downloadFile, reportSize:scheduleSizeReport });
     }
     chatHost.hidden = false;
     chatController.setTheme({ theme:document.documentElement.dataset.theme || window.openai?.theme });

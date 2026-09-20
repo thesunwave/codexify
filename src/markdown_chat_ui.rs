@@ -2,9 +2,11 @@ use rmcp::model::{MetaObject, Resource, ResourceContents};
 use serde_json::json;
 use std::sync::LazyLock;
 
-pub const CHAT_UI_URI: &str = "ui://codexify/markdown-chat/v2/mcp-app.html";
+pub const CHAT_UI_URI: &str = "ui://codexify/markdown-chat/v3/mcp-app.html";
+pub const PREVIOUS_CHAT_UI_URI_V2: &str = "ui://codexify/markdown-chat/v2/mcp-app.html";
 pub const PREVIOUS_CHAT_UI_URI: &str = "ui://codexify/markdown-chat/v1/mcp-app.html";
-pub const SETUP_CHAT_UI_URI: &str = "ui://codexify/setup-chat/v4/mcp-app.html";
+pub const SETUP_CHAT_UI_URI: &str = "ui://codexify/setup-chat/v5/mcp-app.html";
+pub const PREVIOUS_SETUP_CHAT_UI_URI_V4: &str = "ui://codexify/setup-chat/v4/mcp-app.html";
 pub const PREVIOUS_SETUP_CHAT_UI_URI_V3: &str = "ui://codexify/setup-chat/v3/mcp-app.html";
 pub const PREVIOUS_SETUP_CHAT_UI_URI: &str = "ui://codexify/setup-chat/v2/mcp-app.html";
 pub const LEGACY_SETUP_CHAT_UI_URI: &str = "ui://codexify/setup-chat/v1/mcp-app.html";
@@ -87,10 +89,11 @@ pub fn resource() -> Resource {
 pub fn contents_for_uri(uri: &str) -> Option<ResourceContents> {
     let html = match uri {
         SETUP_CHAT_UI_URI
+        | PREVIOUS_SETUP_CHAT_UI_URI_V4
         | PREVIOUS_SETUP_CHAT_UI_URI_V3
         | PREVIOUS_SETUP_CHAT_UI_URI
         | LEGACY_SETUP_CHAT_UI_URI => SETUP_CHAT_UI_HTML.as_str(),
-        CHAT_UI_URI | PREVIOUS_CHAT_UI_URI => CHAT_UI_HTML.as_str(),
+        CHAT_UI_URI | PREVIOUS_CHAT_UI_URI_V2 | PREVIOUS_CHAT_UI_URI => CHAT_UI_HTML.as_str(),
         _ => return None,
     };
     Some(
@@ -121,13 +124,19 @@ mod tests {
         )));
         assert!(html.contains("id=\"tool-total\""));
         assert!(html.contains("tool-call-marker"));
+        assert!(html.contains("id=\"auto-continue\""));
+        assert!(html.contains("AUTO_CONTINUE_MAX = 24"));
+        assert!(html.contains("sendFollowUpMessage"));
+        assert!(html.contains("{ callTool, sendFollowUpMessage, openLink"));
         assert_eq!(resource().uri, SETUP_CHAT_UI_URI);
         assert_eq!(
             tool_meta().get("openai/outputTemplate"),
             Some(&json!(SETUP_CHAT_UI_URI))
         );
         assert!(contents_for_uri(CHAT_UI_URI).is_some());
+        assert!(contents_for_uri(PREVIOUS_CHAT_UI_URI_V2).is_some());
         assert!(contents_for_uri(PREVIOUS_CHAT_UI_URI).is_some());
+        assert!(contents_for_uri(PREVIOUS_SETUP_CHAT_UI_URI_V4).is_some());
         assert!(contents_for_uri(PREVIOUS_SETUP_CHAT_UI_URI).is_some());
         assert!(contents_for_uri(PREVIOUS_SETUP_CHAT_UI_URI_V3).is_some());
         assert!(contents_for_uri(LEGACY_SETUP_CHAT_UI_URI).is_some());
