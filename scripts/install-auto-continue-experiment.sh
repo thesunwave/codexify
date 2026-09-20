@@ -6,7 +6,7 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/
 BIN="/Users/codexify/.codexify/bin/codexify"
 NEXT="/Users/codexify/.codexify/bin/codexify.next"
 BACKUP="/Users/codexify/.codexify/bin/codexify.pre-auto-continue"
-LABEL="system/dev.codexify.service"
+CONFIG="/Users/codexify/.codexify/codexify.config.json"
 
 wait_for_health() {
   local code
@@ -26,8 +26,26 @@ swap_binary() {
   /bin/mv -f "$temporary" "$BIN"
 }
 
+service_pid() {
+  /usr/bin/pgrep -u "$(/usr/bin/id -u)" -f "^${BIN} service run --config ${CONFIG}$" | /usr/bin/head -1 || true
+}
+
 restart_service() {
-  /usr/bin/sudo /bin/launchctl kickstart -k "$LABEL"
+  local old_pid new_pid
+  old_pid="$(service_pid)"
+  if [[ -n "$old_pid" ]]; then
+    /bin/kill -TERM "$old_pid"
+  fi
+  for _ in {1..30}; do
+    new_pid="$(service_pid)"
+    if [[ -n "$new_pid" && ( -z "$old_pid" || "$new_pid" != "$old_pid" ) ]]; then
+      /bin/sleep 1
+      /bin/kill -0 "$new_pid" 2>/dev/null && return 0
+    fi
+    /bin/sleep 1
+  done
+  echo "Codexify service did not become healthy under launchd KeepAlive." >&2
+  return 1
 }
 
 rollback() {
@@ -40,7 +58,6 @@ rollback() {
 }
 
 if [[ "${1:-}" == "rollback" ]]; then
-  /usr/bin/sudo -v
   rollback
   exit 0
 fi
@@ -53,7 +70,6 @@ fi
   exit 1
 }
 
-/usr/bin/sudo -v
 if [[ ! -e "$BACKUP" ]]; then
   /bin/cp -p "$BIN" "$BACKUP"
   /bin/chmod 755 "$BACKUP"
@@ -62,7 +78,7 @@ else
   echo "Keeping existing rollback binary: $BACKUP"
 fi
 
-echo "Installing experimental binary and restarting $LABEL"
+echo "Installing experimental binary; launchd KeepAlive will restart the service"
 swap_binary "$NEXT"
 if ! restart_service || ! wait_for_health; then
   echo "Experimental Codexify failed its localhost health check; rolling back." >&2
