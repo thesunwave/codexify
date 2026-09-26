@@ -372,6 +372,18 @@ fn advertised_tool(tool: &dyn Tool, config: &AppConfig) -> rmcp::model::Tool {
     if config.multi_project && !app_only_tool(tool) {
         fields.push((WORKSPACE_CHANGE_FIELD, WORKSPACE_CHANGE_DESCRIPTION));
     }
+    if config.experimental.chatgpt_bridge
+        && !app_only_tool(tool)
+        && !matches!(
+            tool.name(),
+            "chatgpt_backend_attach" | "chatgpt_backend_exchange"
+        )
+    {
+        fields.push((
+            crate::chatgpt_backend::CONTROL_FIELD,
+            crate::chatgpt_backend::CONTROL_DESCRIPTION,
+        ));
+    }
     let output = if fields.is_empty() {
         tool.output_schema()
     } else {
@@ -1131,6 +1143,44 @@ impl ServerHandler for CodexHandler {
                 crate::markdown_chat::USER_MESSAGE_FIELD,
                 result.new_chat_message_from_user.take(),
             ));
+        }
+        if self.config.experimental.chatgpt_bridge
+            && model_call
+            && !matches!(
+                name.as_str(),
+                "chatgpt_backend_attach" | "chatgpt_backend_exchange"
+            )
+            && let Some(identity) = conversation.as_ref()
+        {
+            match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config)
+                .and_then(|store| store.pending_control_for_worker(identity.stable_key()))
+            {
+                Ok(Some((session_id, command))) => {
+                    let required_action = match command.kind {
+                        crate::chatgpt_backend::BackendCommandKind::Steer => {
+                            "apply_steer_then_ack_control"
+                        }
+                        crate::chatgpt_backend::BackendCommandKind::Cancel => {
+                            "stop_active_task_then_ack_control_and_report_error"
+                        }
+                        _ => unreachable!("only steer/cancel are injected into tool results"),
+                    };
+                    let control = serde_json::to_string(&json!({
+                        "session_id": session_id,
+                        "command": command,
+                        "required_action": required_action,
+                    }))
+                    .expect("ChatGPT backend control envelope is serializable");
+                    output_fields.push((crate::chatgpt_backend::CONTROL_FIELD, Some(control)));
+                }
+                Ok(None) => {
+                    output_fields.push((crate::chatgpt_backend::CONTROL_FIELD, None));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not inspect ChatGPT backend control queue");
+                    output_fields.push((crate::chatgpt_backend::CONTROL_FIELD, None));
+                }
+            }
         }
         if !context.ct.is_cancelled()
             && let Some((chat, end)) = delivery
@@ -3011,6 +3061,32 @@ mod tests {
 
         assert!(builtin_ui_resources(false).is_empty());
         assert!(builtin_ui_contents(false, crate::setup_ui::SETUP_UI_URI).is_none());
+    }
+
+    #[test]
+    fn chatgpt_backend_control_is_advertised_on_ordinary_model_tools_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(root.path().to_path_buf());
+        config.experimental.chatgpt_bridge = true;
+
+        let ordinary = advertised_tool(&crate::tools::get_environment::GetEnvironment, &config);
+        let ordinary_schema = ordinary.output_schema.expect("ordinary tool should have output schema");
+        assert!(
+            ordinary_schema["properties"]
+                .get(crate::chatgpt_backend::CONTROL_FIELD)
+                .is_some()
+        );
+
+        let backend = advertised_tool(
+            &crate::tools::chatgpt_backend::ChatGptBackendTool::Exchange,
+            &config,
+        );
+        let backend_schema = backend.output_schema.expect("backend exchange has output schema");
+        assert!(
+            backend_schema["properties"]
+                .get(crate::chatgpt_backend::CONTROL_FIELD)
+                .is_none()
+        );
     }
 
     #[test]

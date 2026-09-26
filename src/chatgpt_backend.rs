@@ -14,6 +14,8 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_COMMANDS: usize = 64;
 pub const DEFAULT_WAIT_MS: u64 = 115_000;
+pub const CONTROL_FIELD: &str = "chatgpt_backend_control";
+pub const CONTROL_DESCRIPTION: &str = "Pending ChatGPT backend steer/cancel command for the active coding task. This JSON string is injected into ordinary Codexify tool results so control can reach a long-running task before the next backend exchange. Apply steer immediately; on cancel stop the active task and return an error through chatgpt_backend_exchange. Acknowledge the control command sequence through chatgpt_backend_exchange; until acknowledged it may be replayed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +197,55 @@ impl ChatGptBackendStore {
         self.with_lock(|| self.read_session(session_id))
     }
 
+    pub fn pending_control_for_worker(
+        &self,
+        worker: &str,
+    ) -> Result<Option<(String, BackendCommand)>, String> {
+        validate_worker(worker)?;
+        self.with_lock(|| {
+            let mut sessions = self.read_all()?;
+            sessions.sort_by_key(|session| session.created_at_ms);
+            let Some(mut session) = sessions.into_iter().rev().find(|session| {
+                session.worker == worker
+                    && session.closed_at_ms.is_none()
+                    && session.active_task_seq.is_some()
+            }) else {
+                return Ok(None);
+            };
+
+            // Reaching any ordinary Codexify tool boundary proves the model already
+            // received and started processing the active task. Mark it acknowledged
+            // here so a subsequent non-blocking exchange used only to ACK injected
+            // control cannot replay the original task.
+            if let Some(active_seq) = session.active_task_seq
+                && let Some(task) = session
+                    .commands
+                    .iter_mut()
+                    .find(|command| command.seq == active_seq)
+                && task.acknowledged_at_ms.is_none()
+            {
+                task.acknowledged_at_ms = Some(now_ms()?);
+                session.updated_at_ms = now_ms()?;
+            }
+
+            let Some(index) = session.commands.iter().position(|command| {
+                matches!(command.kind, BackendCommandKind::Steer | BackendCommandKind::Cancel)
+                    && command.acknowledged_at_ms.is_none()
+            }) else {
+                self.write_session(&session)?;
+                return Ok(None);
+            };
+
+            if session.commands[index].delivered_at_ms.is_none() {
+                let now = now_ms()?;
+                session.commands[index].delivered_at_ms = Some(now);
+                session.updated_at_ms = now;
+            }
+            self.write_session(&session)?;
+            Ok(Some((session.id.clone(), session.commands[index].clone())))
+        })
+    }
+
     pub fn enqueue_command(
         &self,
         session_id: &str,
@@ -300,11 +351,23 @@ impl ChatGptBackendStore {
                 validate_text("event content", &outbound.content, MAX_EVENT_BYTES)?;
                 let task = session
                     .commands
-                    .iter()
+                    .iter_mut()
                     .find(|command| command.seq == outbound.command_seq)
                     .ok_or_else(|| format!("unknown task sequence {}", outbound.command_seq))?;
                 if task.kind != BackendCommandKind::Task {
                     return Err("outbound result/error must reference a task command".into());
+                }
+                if task.delivered_at_ms.is_none() {
+                    return Err(format!(
+                        "task sequence {} has not been delivered",
+                        outbound.command_seq
+                    ));
+                }
+                // Returning a terminal event is itself a definitive acknowledgement of the
+                // task. This leaves ack_command_seq available for an injected steer/cancel
+                // command in the same exchange call.
+                if task.acknowledged_at_ms.is_none() {
+                    task.acknowledged_at_ms = Some(now_ms()?);
                 }
 
                 if let Some(existing) = session.events.iter().find(|event| {
@@ -799,6 +862,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injected_control_replays_until_ack_and_can_share_exchange_with_task_result() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        let delivered = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(delivered, ExchangeOutcome::Command(ref command) if command.seq == task.seq));
+
+        let steer = store
+            .enqueue_command(&session.id, BackendCommandKind::Steer, "change direction".into())
+            .unwrap();
+        for _ in 0..2 {
+            let (session_id, control) = store
+                .pending_control_for_worker("worker-a")
+                .unwrap()
+                .expect("steer should be injected while task is active");
+            assert_eq!(session_id, session.id);
+            assert_eq!(control.seq, steer.seq);
+            assert_eq!(control.kind, BackendCommandKind::Steer);
+            assert!(control.delivered_at_ms.is_some());
+            assert!(control.acknowledged_at_ms.is_none());
+        }
+
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                Some(steer.seq),
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Result,
+                    command_seq: task.seq,
+                    content: "done after steer".into(),
+                }),
+            )
+            .unwrap();
+
+        assert!(store.pending_control_for_worker("worker-a").unwrap().is_none());
+        let current = store.session(&session.id).unwrap();
+        assert!(current.active_task_seq.is_none());
+        assert!(
+            current
+                .commands
+                .iter()
+                .find(|command| command.seq == task.seq)
+                .unwrap()
+                .acknowledged_at_ms
+                .is_some()
+        );
+        assert!(
+            current
+                .commands
+                .iter()
+                .find(|command| command.seq == steer.seq)
+                .unwrap()
+                .acknowledged_at_ms
+                .is_some()
+        );
+        assert!(current.events.iter().any(|event| {
+            event.command_seq == Some(task.seq)
+                && event.kind == BackendEventKind::Result
+                && event.content == "done after steer"
+        }));
+    }
+
+    #[tokio::test]
     async fn cancelled_wait_can_resume_and_deliver_the_next_command() {
         let (_root, store) = store();
         let session = store.attach("worker-a").unwrap();
@@ -889,5 +1027,68 @@ mod tests {
                 .unwrap();
             assert!(matches!(outcome, ExchangeOutcome::Command(ref value) if value.seq == command.seq));
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_task_event_acks_task_while_control_uses_the_explicit_ack_slot() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let cancel = store
+            .enqueue_command(&session.id, BackendCommandKind::Cancel, String::new())
+            .unwrap();
+        let (_, delivered_cancel) = store
+            .pending_control_for_worker("worker-a")
+            .unwrap()
+            .expect("cancel should be injected");
+        assert_eq!(delivered_cancel.seq, cancel.seq);
+
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                Some(cancel.seq),
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Error,
+                    command_seq: task.seq,
+                    content: "cancelled".into(),
+                }),
+            )
+            .unwrap();
+
+        let session = store.session(&session.id).unwrap();
+        assert!(
+            session
+                .commands
+                .iter()
+                .find(|command| command.seq == task.seq)
+                .unwrap()
+                .acknowledged_at_ms
+                .is_some()
+        );
+        assert!(
+            session
+                .commands
+                .iter()
+                .find(|command| command.seq == cancel.seq)
+                .unwrap()
+                .acknowledged_at_ms
+                .is_some()
+        );
+        assert_eq!(session.active_task_seq, None);
+        assert_eq!(session.events.last().unwrap().kind, BackendEventKind::Error);
+        assert_eq!(session.events.last().unwrap().content, "cancelled");
     }
 }
