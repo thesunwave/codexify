@@ -204,6 +204,42 @@ pub enum CliCommand {
 pub enum ChatGptBridgeCommand {
     /// Queue a prompt and wait for the dedicated ChatGPT worker to return a result.
     Ask(ChatGptBridgeAskArgs),
+    /// List long-lived ChatGPT coding-backend sessions.
+    Sessions(ChatGptBackendSessionsArgs),
+    /// Send a control command to one long-lived ChatGPT coding-backend session.
+    Send(ChatGptBackendSendArgs),
+    /// Inspect one long-lived ChatGPT coding-backend session.
+    Status(ChatGptBackendStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSessionsArgs {
+    /// Emit the complete session records as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSendArgs {
+    /// Backend session id returned by chatgpt_backend_attach.
+    pub session_id: String,
+    /// Command content. Required for task/steer; optional for cancel/finish.
+    pub content: Option<String>,
+    /// Control command kind: task, steer, cancel, or finish.
+    #[arg(long, default_value = "task")]
+    pub kind: String,
+    /// Emit the queued command as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendStatusArgs {
+    /// Backend session id returned by chatgpt_backend_attach.
+    pub session_id: String,
+    /// Emit the complete session record as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

@@ -186,11 +186,22 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            CliCommand::ChatGptBridge {
-                command: ChatGptBridgeCommand::Ask(args),
-            } => {
+            CliCommand::ChatGptBridge { command } => {
                 let config = load_config(cli).map_err(anyhow::Error::msg)?;
-                return codexify::chatgpt_bridge::run_ask_cli(&config, args).await;
+                return match command {
+                    ChatGptBridgeCommand::Ask(args) => {
+                        codexify::chatgpt_bridge::run_ask_cli(&config, args).await
+                    }
+                    ChatGptBridgeCommand::Sessions(args) => {
+                        codexify::chatgpt_backend::run_sessions_cli(&config, args)
+                    }
+                    ChatGptBridgeCommand::Send(args) => {
+                        codexify::chatgpt_backend::run_send_cli(&config, args)
+                    }
+                    ChatGptBridgeCommand::Status(args) => {
+                        codexify::chatgpt_backend::run_status_cli(&config, args)
+                    }
+                };
             }
             CliCommand::Projects {
                 command: ProjectsCommand::List(args),

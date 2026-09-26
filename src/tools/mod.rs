@@ -3,6 +3,7 @@
 pub mod apply_patch;
 pub mod check_for_updates;
 pub mod chatgpt_bridge;
+pub mod chatgpt_backend;
 pub mod clock_curr_time;
 pub mod clock_sleep;
 pub mod doctor;

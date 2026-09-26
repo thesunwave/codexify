@@ -40,10 +40,14 @@ pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
         config.markdown_chat.enabled,
         config.artifact_ingress.max_concurrent_downloads,
     );
-    if config.experimental.chatgpt_bridge && config.ui_widgets {
-        tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Worker));
-        tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Submit));
-        tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Next));
+    if config.experimental.chatgpt_bridge {
+        tools.push(Box::new(tools::chatgpt_backend::ChatGptBackendTool::Attach));
+        tools.push(Box::new(tools::chatgpt_backend::ChatGptBackendTool::Exchange));
+        if config.ui_widgets {
+            tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Worker));
+            tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Submit));
+            tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Next));
+        }
     }
     if config.markdown_chat.enabled && config.ui_widgets {
         tools.push(Box::new(tools::markdown_chat_ui::ChatUiTool::Send));
@@ -159,19 +163,26 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_bridge_tools_require_the_experiment_and_widgets() {
+    fn chatgpt_backend_requires_only_the_experiment_while_reverse_bridge_requires_widgets() {
         let root = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(root.path().to_path_buf());
-        assert!(!names(&config).contains(&"chatgpt_bridge_worker"));
+        let disabled = names(&config);
+        assert!(!disabled.contains(&"chatgpt_backend_attach"));
+        assert!(!disabled.contains(&"chatgpt_backend_exchange"));
+        assert!(!disabled.contains(&"chatgpt_bridge_worker"));
 
         config.experimental.chatgpt_bridge = true;
         let enabled = names(&config);
+        assert!(enabled.contains(&"chatgpt_backend_attach"));
+        assert!(enabled.contains(&"chatgpt_backend_exchange"));
         assert!(enabled.contains(&"chatgpt_bridge_worker"));
         assert!(enabled.contains(&"chatgpt_bridge_submit_result"));
         assert!(enabled.contains(&"chatgpt_bridge_next"));
 
         config.ui_widgets = false;
         let headless = names(&config);
+        assert!(headless.contains(&"chatgpt_backend_attach"));
+        assert!(headless.contains(&"chatgpt_backend_exchange"));
         assert!(!headless.contains(&"chatgpt_bridge_worker"));
         assert!(!headless.contains(&"chatgpt_bridge_submit_result"));
         assert!(!headless.contains(&"chatgpt_bridge_next"));

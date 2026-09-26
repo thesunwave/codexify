@@ -15,6 +15,7 @@ pub mod bridge;
 pub mod bridged_resources;
 pub mod chatgpt_bridge;
 pub mod chatgpt_bridge_ui;
+pub mod chatgpt_backend;
 pub mod codex_config;
 pub mod codex_mcp;
 mod codex_plugin_skills;
