@@ -758,6 +758,34 @@ mod tests {
         assert!(session.commands[0].acknowledged_at_ms.is_some());
     }
 
+    #[test]
+    fn pending_command_queue_is_bounded() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+
+        for index in 1..MAX_PENDING_COMMANDS {
+            store
+                .enqueue_command(
+                    &session.id,
+                    BackendCommandKind::Steer,
+                    format!("steer-{index}"),
+                )
+                .unwrap();
+        }
+
+        let error = store
+            .enqueue_command(
+                &session.id,
+                BackendCommandKind::Steer,
+                "one-too-many".into(),
+            )
+            .unwrap_err();
+        assert!(error.contains("already has 64 pending commands"));
+    }
+
     #[tokio::test]
     async fn delivered_command_is_replayed_until_acknowledged() {
         let (_root, store) = store();
