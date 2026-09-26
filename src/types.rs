@@ -787,6 +787,7 @@ pub struct WorktreeConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ExperimentalConfig {
     pub agent_tickets: bool,
+    pub chatgpt_bridge: bool,
     /// The real tool behavior remains authoritative for dispatch and authorization.
     pub force_read_only_tool_annotations: bool,
     pub claude_skills: bool,

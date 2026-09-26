@@ -6,8 +6,8 @@ use serde::Serialize;
 
 use anyhow::Context;
 use codexify::config::{
-    Cli, CliCommand, ProjectsCommand, ProjectsListArgs, ServiceCommand, config_path_for_quickstart,
-    config_path_for_service, load_config, load_project_catalog_for_cli,
+    ChatGptBridgeCommand, Cli, CliCommand, ProjectsCommand, ProjectsListArgs, ServiceCommand,
+    config_path_for_quickstart, config_path_for_service, load_config, load_project_catalog_for_cli,
 };
 use codexify::doctor;
 use codexify::legacy_migration;
@@ -185,6 +185,12 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 return Ok(());
+            }
+            CliCommand::ChatGptBridge {
+                command: ChatGptBridgeCommand::Ask(args),
+            } => {
+                let config = load_config(cli).map_err(anyhow::Error::msg)?;
+                return codexify::chatgpt_bridge::run_ask_cli(&config, args).await;
             }
             CliCommand::Projects {
                 command: ProjectsCommand::List(args),

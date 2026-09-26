@@ -175,6 +175,12 @@ pub enum CliCommand {
     Config(ConfigArgs),
     /// Diagnose the local Codexify installation without changing it.
     Doctor(DoctorArgs),
+    /// Exercise the experimental ChatGPT reverse-RPC bridge from this machine.
+    #[command(name = "chatgpt-bridge")]
+    ChatGptBridge {
+        #[command(subcommand)]
+        command: ChatGptBridgeCommand,
+    },
     /// Inspect the read-only project catalogue used by multi-project mode.
     Projects {
         #[command(subcommand)]
@@ -192,6 +198,24 @@ pub enum CliCommand {
     /// Migrate state from the pre-Codexify application name during installation.
     #[command(hide = true)]
     MigrateLegacyInstall,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChatGptBridgeCommand {
+    /// Queue a prompt and wait for the dedicated ChatGPT worker to return a result.
+    Ask(ChatGptBridgeAskArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBridgeAskArgs {
+    /// Prompt to send through the ChatGPT worker conversation.
+    pub prompt: String,
+    /// How long to wait for a terminal bridge result.
+    #[arg(long, default_value_t = 180)]
+    pub timeout_seconds: u64,
+    /// Emit the final bridge request record as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -589,6 +613,7 @@ impl PartialMcpServerSpec {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PartialExperimental {
     agent_tickets: Option<bool>,
+    chatgpt_bridge: Option<bool>,
     force_read_only_tool_annotations: Option<bool>,
     claude_skills: Option<bool>,
 }
@@ -1662,6 +1687,7 @@ fn load_config_with_announcements(
         ui_widgets: file.ui_widgets.unwrap_or(true),
         experimental: ExperimentalConfig {
             agent_tickets: experimental.agent_tickets.unwrap_or(false),
+            chatgpt_bridge: experimental.chatgpt_bridge.unwrap_or(false),
             force_read_only_tool_annotations: experimental
                 .force_read_only_tool_annotations
                 .or(file.force_read_only_tool_annotations)
@@ -1955,6 +1981,11 @@ mod tests {
         assert!(
             !default_config(root.path().to_path_buf())
                 .experimental
+                .chatgpt_bridge
+        );
+        assert!(
+            !default_config(root.path().to_path_buf())
+                .experimental
                 .claude_skills
         );
         assert!(
@@ -2000,6 +2031,7 @@ mod tests {
                 "codexMcp": {"enabled": false},
                 "experimental": {
                     "agentTickets": true,
+                    "chatgptBridge": true,
                     "forceReadOnlyToolAnnotations": true,
                     "claudeSkills": true
                 }
@@ -2010,6 +2042,7 @@ mod tests {
         let args = Cli::parse_from(["codexify", "--config", path.to_str().unwrap()]);
         let config = load_config(args).unwrap();
         assert!(config.experimental.agent_tickets);
+        assert!(config.experimental.chatgpt_bridge);
         assert!(config.experimental.force_read_only_tool_annotations);
         assert!(config.experimental.claude_skills);
         assert!(
@@ -2246,6 +2279,7 @@ mod tests {
                 "experimental",
                 &[
                     "agentTickets",
+                    "chatgptBridge",
                     "forceReadOnlyToolAnnotations",
                     "claudeSkills",
                 ][..],

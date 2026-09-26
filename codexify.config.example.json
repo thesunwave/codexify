@@ -5,6 +5,7 @@
   "uiWidgets": true,
   "experimental": {
     "agentTickets": false,
+    "chatgptBridge": false,
     "forceReadOnlyToolAnnotations": false,
     "claudeSkills": false
   },

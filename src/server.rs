@@ -495,6 +495,9 @@ impl ServerHandler for CodexHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         let mut resources = builtin_ui_resources(self.config.ui_widgets);
+        if self.config.ui_widgets && self.config.experimental.chatgpt_bridge {
+            resources.push(crate::chatgpt_bridge_ui::resource());
+        }
         if self.config.ui_widgets && self.config.markdown_chat.enabled {
             resources.push(crate::markdown_chat_ui::resource());
         }
@@ -576,11 +579,17 @@ impl ServerHandler for CodexHandler {
                 None,
             ));
         }
-        let contents = builtin_ui_contents(self.config.ui_widgets, &request.uri).or_else(|| {
-            (self.config.ui_widgets && self.config.markdown_chat.enabled)
-                .then(|| crate::markdown_chat_ui::contents_for_uri(&request.uri))
-                .flatten()
-        });
+        let contents = builtin_ui_contents(self.config.ui_widgets, &request.uri)
+            .or_else(|| {
+                (self.config.ui_widgets && self.config.experimental.chatgpt_bridge)
+                    .then(|| crate::chatgpt_bridge_ui::contents_for_uri(&request.uri))
+                    .flatten()
+            })
+            .or_else(|| {
+                (self.config.ui_widgets && self.config.markdown_chat.enabled)
+                    .then(|| crate::markdown_chat_ui::contents_for_uri(&request.uri))
+                    .flatten()
+            });
         let Some(contents) = contents else {
             return Err(McpError::resource_not_found(
                 format!("Unknown resource: {}", request.uri),
