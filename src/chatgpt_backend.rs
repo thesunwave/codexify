@@ -49,7 +49,7 @@ pub struct BackendCommand {
     pub seq: u64,
     pub id: String,
     pub kind: BackendCommandKind,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     pub created_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -784,6 +784,89 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("already has 64 pending commands"));
+    }
+
+    #[test]
+    fn steer_and_cancel_require_an_active_or_queued_task() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        for kind in [BackendCommandKind::Steer, BackendCommandKind::Cancel] {
+            let error = store
+                .enqueue_command(&session.id, kind, "control".into())
+                .unwrap_err();
+            assert!(error.contains("requires an active or queued task"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_can_resume_and_deliver_the_next_command() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let outcome = store
+            .exchange_wait("worker-a", &session.id, true, 5_000, cancellation)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExchangeOutcome::Cancelled));
+        assert!(!store.session(&session.id).unwrap().waiting);
+
+        let command = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "resume".into())
+            .unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExchangeOutcome::Command(ref value) if value.seq == command.seq));
+    }
+
+    #[tokio::test]
+    async fn finish_closes_the_session_and_next_attach_creates_a_new_one() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let finish = store
+            .enqueue_command(&session.id, BackendCommandKind::Finish, String::new())
+            .unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExchangeOutcome::Command(ref value) if value.seq == finish.seq && value.kind == BackendCommandKind::Finish));
+        assert!(store.session(&session.id).unwrap().closed_at_ms.is_some());
+        assert!(
+            store
+                .enqueue_command(&session.id, BackendCommandKind::Task, "too late".into())
+                .unwrap_err()
+                .contains("is closed")
+        );
+        let closed = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(closed, ExchangeOutcome::Closed));
+
+        let replacement = store.attach("worker-a").unwrap();
+        assert_ne!(replacement.id, session.id);
+        assert!(replacement.closed_at_ms.is_none());
     }
 
     #[tokio::test]
