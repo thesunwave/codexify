@@ -237,9 +237,12 @@ pub struct ChatGptBackendSendArgs {
 pub struct ChatGptBackendStatusArgs {
     /// Backend session id returned by chatgpt_backend_attach.
     pub session_id: String,
-    /// Emit the complete session record as JSON.
+    /// Emit the production-facing session inspection as JSON.
     #[arg(long)]
     pub json: bool,
+    /// Print the bounded lifecycle timeline after the status summary.
+    #[arg(long)]
+    pub timeline: bool,
 }
 
 #[derive(Args, Debug)]

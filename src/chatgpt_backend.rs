@@ -13,7 +13,12 @@ use crate::types::AppConfig;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_COMMANDS: usize = 64;
+const MAX_RETAINED_COMMANDS: usize = 32;
+const MAX_RETAINED_EVENTS: usize = 32;
 pub const DEFAULT_WAIT_MS: u64 = 115_000;
+const WAIT_LEASE_GRACE_MS: u64 = 30_000;
+const READY_STALE_MS: u64 = 180_000;
+const WORKING_STALE_MS: u64 = 600_000;
 pub const CONTROL_FIELD: &str = "chatgpt_backend_control";
 pub const CONTROL_DESCRIPTION: &str = "Pending ChatGPT backend steer/cancel command for the active coding task. This JSON string is injected into ordinary Codexify tool results so control can reach a long-running task before the next backend exchange. Apply steer immediately; on cancel stop the active task and return an error through chatgpt_backend_exchange. Acknowledge the control command sequence through chatgpt_backend_exchange; until acknowledged it may be replayed.";
 
@@ -95,12 +100,20 @@ pub struct BackendSession {
     pub worker: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    #[serde(default)]
+    pub last_heartbeat_at_ms: u64,
     pub next_command_seq: u64,
     pub next_event_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_task_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_at_ms: Option<u64>,
     pub waiting: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_wait_started_at_ms: Option<u64>,
@@ -108,20 +121,175 @@ pub struct BackendSession {
     pub last_wait_returned_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<BackendWorkspace>,
+    #[serde(default)]
+    pub dropped_commands: u64,
+    #[serde(default)]
+    pub dropped_events: u64,
+    #[serde(default)]
+    pub idempotent_retries: u64,
+    #[serde(default)]
+    pub completed_tasks: u64,
+    #[serde(default)]
+    pub failed_tasks: u64,
     pub commands: Vec<BackendCommand>,
     pub events: Vec<BackendEvent>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendLifecycleState {
+    Attaching,
+    Ready,
+    Waiting,
+    Working,
+    Cancelling,
+    Finished,
+    Failed,
+    Stale,
+}
+
+impl BackendLifecycleState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attaching => "attaching",
+            Self::Ready => "ready",
+            Self::Waiting => "waiting",
+            Self::Working => "working",
+            Self::Cancelling => "cancelling",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendSessionInspection {
+    pub session_id: String,
+    pub state: BackendLifecycleState,
+    pub live: bool,
+    pub last_activity_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    pub retained_commands: usize,
+    pub retained_events: usize,
+    pub pending_commands: usize,
+    pub completed_tasks: u64,
+    pub failed_tasks: u64,
+    pub idempotent_retries: u64,
+    pub dropped_commands: u64,
+    pub dropped_events: u64,
+    pub next_command_seq: u64,
+    pub next_event_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_seq: Option<u64>,
+    pub waiting: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<BackendWorkspace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<BackendEventSummary>,
+    pub tasks: Vec<BackendTaskInspection>,
+    pub timeline: Vec<BackendTimelineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendEventSummary {
+    pub seq: u64,
+    pub kind: BackendEventKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_seq: Option<u64>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendTaskInspection {
+    pub command_seq: u64,
+    pub queued_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<BackendEventKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendTimelineEntry {
+    pub at_ms: u64,
+    pub kind: &'static str,
+    pub seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_kind: Option<BackendCommandKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_kind: Option<BackendEventKind>,
+}
+
 impl BackendSession {
     pub fn state(&self) -> &'static str {
-        if self.closed_at_ms.is_some() {
-            "closed"
-        } else if self.active_task_seq.is_some() {
-            "busy"
-        } else if self.waiting {
-            "waiting"
+        self.lifecycle_state_at(self.updated_at_ms).as_str()
+    }
+
+    fn last_activity_at_ms(&self) -> u64 {
+        self.last_heartbeat_at_ms.max(self.updated_at_ms)
+    }
+
+    fn pending_cancel_for_active_task(&self) -> bool {
+        let Some(active) = self.active_task_seq else {
+            return false;
+        };
+        self.commands.iter().any(|command| {
+            command.kind == BackendCommandKind::Cancel
+                && command.acknowledged_at_ms.is_none()
+                && control_targets_task(command, active)
+        })
+    }
+
+    fn stale_reason_at(&self, now: u64) -> Option<String> {
+        if self.closed_at_ms.is_some() || self.failed_at_ms.is_some() || self.stale_at_ms.is_some() {
+            return self.stale_at_ms.map(|_| {
+                self.stale_reason
+                    .clone()
+                    .unwrap_or_else(|| "session was previously marked stale".to_string())
+            });
+        }
+        if self.waiting {
+            let started = self.last_wait_started_at_ms.unwrap_or(self.last_activity_at_ms());
+            if now.saturating_sub(started) > DEFAULT_WAIT_MS.saturating_add(WAIT_LEASE_GRACE_MS) {
+                return Some("exchange wait lease expired".into());
+            }
+            return None;
+        }
+        let age = now.saturating_sub(self.last_activity_at_ms());
+        if self.active_task_seq.is_some() {
+            (age > WORKING_STALE_MS).then(|| "active task heartbeat expired".into())
         } else {
-            "attached"
+            (age > READY_STALE_MS).then(|| "backend turn stopped renewing exchange".into())
+        }
+    }
+
+    fn lifecycle_state_at(&self, now: u64) -> BackendLifecycleState {
+        if self.failed_at_ms.is_some() {
+            BackendLifecycleState::Failed
+        } else if self.closed_at_ms.is_some() {
+            BackendLifecycleState::Finished
+        } else if self.stale_at_ms.is_some() || self.stale_reason_at(now).is_some() {
+            BackendLifecycleState::Stale
+        } else if self.pending_cancel_for_active_task() {
+            BackendLifecycleState::Cancelling
+        } else if self.active_task_seq.is_some() {
+            BackendLifecycleState::Working
+        } else if self.waiting {
+            BackendLifecycleState::Waiting
+        } else {
+            BackendLifecycleState::Ready
         }
     }
 }
@@ -178,18 +346,27 @@ impl ChatGptBackendStore {
         self.with_lock(|| {
             let mut sessions = self.read_all()?;
             sessions.sort_by_key(|session| session.created_at_ms);
-            if let Some(session) = sessions
+            if let Some(mut session) = sessions
                 .into_iter()
                 .rev()
                 .find(|session| session.worker == worker && session.closed_at_ms.is_none())
             {
-                if session.workspace != workspace {
-                    return Err(format!(
-                        "ChatGPT backend worker already has live session {} bound to a different workspace",
-                        session.id
-                    ));
+                let now = now_ms()?;
+                if let Some(reason) = session.stale_reason_at(now) {
+                    session.stale_at_ms = Some(now);
+                    session.stale_reason = Some(reason);
+                    session.waiting = false;
+                    session.updated_at_ms = now;
+                    self.write_session(&session)?;
+                } else {
+                    if session.workspace != workspace {
+                        return Err(format!(
+                            "ChatGPT backend worker already has live session {} bound to a different workspace",
+                            session.id
+                        ));
+                    }
+                    return Ok(session);
                 }
-                return Ok(session);
             }
             let now = now_ms()?;
             let ready_content = workspace
@@ -206,14 +383,23 @@ impl ChatGptBackendStore {
                 worker: worker.to_string(),
                 created_at_ms: now,
                 updated_at_ms: now,
+                last_heartbeat_at_ms: now,
                 next_command_seq: 1,
                 next_event_seq: 2,
                 active_task_seq: None,
                 closed_at_ms: None,
+                stale_at_ms: None,
+                stale_reason: None,
+                failed_at_ms: None,
                 waiting: false,
                 last_wait_started_at_ms: None,
                 last_wait_returned_at_ms: None,
                 workspace,
+                dropped_commands: 0,
+                dropped_events: 0,
+                idempotent_retries: 0,
+                completed_tasks: 0,
+                failed_tasks: 0,
                 commands: Vec::new(),
                 events: vec![BackendEvent {
                     seq: 1,
@@ -237,9 +423,60 @@ impl ChatGptBackendStore {
         })
     }
 
+    pub fn list_inspections(&self) -> Result<Vec<BackendSessionInspection>, String> {
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut sessions = self.read_all()?;
+            sessions.sort_by_key(|session| session.created_at_ms);
+            let mut inspections = Vec::with_capacity(sessions.len());
+            for mut session in sessions {
+                let changed = mark_session_stale_if_expired(&mut session, now);
+                if changed {
+                    self.write_session(&session)?;
+                    session = self.read_session(&session.id)?;
+                }
+                inspections.push(inspect_session(session, now));
+            }
+            Ok(inspections)
+        })
+    }
+
     pub fn session(&self, session_id: &str) -> Result<BackendSession, String> {
         validate_id(session_id)?;
         self.with_lock(|| self.read_session(session_id))
+    }
+
+    pub fn inspection(&self, session_id: &str) -> Result<BackendSessionInspection, String> {
+        validate_id(session_id)?;
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut session = self.read_session(session_id)?;
+            if mark_session_stale_if_expired(&mut session, now) {
+                self.write_session(&session)?;
+                session = self.read_session(session_id)?;
+            }
+            Ok(inspect_session(session, now))
+        })
+    }
+
+    pub fn touch_worker_activity(&self, worker: &str) -> Result<(), String> {
+        validate_worker(worker)?;
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut sessions = self.read_all()?;
+            sessions.sort_by_key(|session| session.created_at_ms);
+            let Some(mut session) = sessions.into_iter().rev().find(|session| {
+                session.worker == worker
+                    && session.closed_at_ms.is_none()
+                    && session.failed_at_ms.is_none()
+                    && session.stale_at_ms.is_none()
+            }) else {
+                return Ok(());
+            };
+            session.last_heartbeat_at_ms = now;
+            session.updated_at_ms = now;
+            self.write_session(&session)
+        })
     }
 
     pub fn active_task_for_worker(&self, worker: &str) -> Result<Option<(String, u64)>, String> {
@@ -247,12 +484,24 @@ impl ChatGptBackendStore {
         self.with_lock(|| {
             let mut sessions = self.read_all()?;
             sessions.sort_by_key(|session| session.created_at_ms);
-            Ok(sessions.into_iter().rev().find_map(|session| {
-                (session.worker == worker && session.closed_at_ms.is_none())
-                    .then_some(session.active_task_seq)
-                    .flatten()
-                    .map(|task_seq| (session.id, task_seq))
-            }))
+            let Some(mut session) = sessions.into_iter().rev().find(|session| {
+                session.worker == worker
+                    && session.closed_at_ms.is_none()
+                    && session.failed_at_ms.is_none()
+                    && session.stale_at_ms.is_none()
+                    && session.active_task_seq.is_some()
+            }) else {
+                return Ok(None);
+            };
+            let now = now_ms()?;
+            session.last_heartbeat_at_ms = now;
+            session.updated_at_ms = now;
+            let task_seq = session
+                .active_task_seq
+                .expect("active backend session search guarantees an active task");
+            let id = session.id.clone();
+            self.write_session(&session)?;
+            Ok(Some((id, task_seq)))
         })
     }
 
@@ -276,6 +525,10 @@ impl ChatGptBackendStore {
                 .active_task_seq
                 .expect("active backend session search guarantees an active task");
 
+            let boundary_now = now_ms()?;
+            session.last_heartbeat_at_ms = boundary_now;
+            session.updated_at_ms = boundary_now;
+
             // Reaching any ordinary Codexify tool boundary proves the model already
             // received and started processing the active task. Mark it acknowledged
             // here so a subsequent non-blocking exchange used only to ACK injected
@@ -286,8 +539,7 @@ impl ChatGptBackendStore {
                 .find(|command| command.seq == active_seq)
                 && task.acknowledged_at_ms.is_none()
             {
-                task.acknowledged_at_ms = Some(now_ms()?);
-                session.updated_at_ms = now_ms()?;
+                task.acknowledged_at_ms = Some(boundary_now);
             }
 
             let targets_active = |command: &BackendCommand| {
@@ -392,6 +644,15 @@ impl ChatGptBackendStore {
             if session.closed_at_ms.is_some() {
                 return Err(format!("ChatGPT backend session {session_id} is closed"));
             }
+            let now = now_ms()?;
+            if mark_session_stale_if_expired(&mut session, now) {
+                self.write_session(&session)?;
+            }
+            if session.stale_at_ms.is_some() {
+                return Err(format!(
+                    "ChatGPT backend session {session_id} is stale; attach a fresh backend session"
+                ));
+            }
             let pending = session
                 .commands
                 .iter()
@@ -435,7 +696,6 @@ impl ChatGptBackendStore {
                     }),
                 BackendCommandKind::Task | BackendCommandKind::Finish => None,
             };
-            let now = now_ms()?;
             let command = BackendCommand {
                 seq: session.next_command_seq,
                 id: new_id()?,
@@ -469,6 +729,18 @@ impl ChatGptBackendStore {
             if session.closed_at_ms.is_some() {
                 return Err(format!("ChatGPT backend session {session_id} is closed"));
             }
+            let now = now_ms()?;
+            if mark_session_stale_if_expired(&mut session, now) {
+                self.write_session(&session)?;
+            }
+            if session.stale_at_ms.is_some() {
+                return Err(format!(
+                    "ChatGPT backend session {session_id} is stale; call chatgpt_backend_attach to start a fresh session"
+                ));
+            }
+            session.last_heartbeat_at_ms = now;
+            session.updated_at_ms = now;
+            let mut observed_retry = false;
 
             if let Some(seq) = ack_command_seq {
                 let command = session
@@ -480,7 +752,9 @@ impl ChatGptBackendStore {
                     return Err(format!("command sequence {seq} has not been delivered"));
                 }
                 if command.acknowledged_at_ms.is_none() {
-                    command.acknowledged_at_ms = Some(now_ms()?);
+                    command.acknowledged_at_ms = Some(now);
+                } else {
+                    observed_retry = true;
                 }
             }
 
@@ -549,6 +823,7 @@ impl ChatGptBackendStore {
                         ));
                     }
                     // Exact retries are idempotent even after active_task_seq was cleared.
+                    observed_retry = true;
                     session.active_task_seq = None;
                 } else {
                     if session.active_task_seq != Some(outbound.command_seq) {
@@ -565,10 +840,17 @@ impl ChatGptBackendStore {
                         content: outbound.content,
                         created_at_ms: now,
                     });
+                    session.completed_tasks = session.completed_tasks.saturating_add(1);
+                    if outbound.kind == BackendEventKind::Error {
+                        session.failed_tasks = session.failed_tasks.saturating_add(1);
+                    }
                     session.next_event_seq = session.next_event_seq.saturating_add(1);
                     session.active_task_seq = None;
                     session.updated_at_ms = now;
                 }
+            }
+            if observed_retry {
+                session.idempotent_retries = session.idempotent_retries.saturating_add(1);
             }
             self.write_session(&session)
         })
@@ -660,11 +942,13 @@ impl ChatGptBackendStore {
         self.with_lock(|| {
             let mut session = self.read_session(session_id)?;
             ensure_worker(&session, worker)?;
+            let now = now_ms()?;
             session.waiting = waiting;
             if waiting {
-                session.last_wait_started_at_ms = Some(now_ms()?);
+                session.last_wait_started_at_ms = Some(now);
             }
-            session.updated_at_ms = now_ms()?;
+            session.last_heartbeat_at_ms = now;
+            session.updated_at_ms = now;
             self.write_session(&session)
         })
     }
@@ -673,9 +957,11 @@ impl ChatGptBackendStore {
         self.with_lock(|| {
             let mut session = self.read_session(session_id)?;
             ensure_worker(&session, worker)?;
+            let now = now_ms()?;
             session.waiting = false;
-            session.last_wait_returned_at_ms = Some(now_ms()?);
-            session.updated_at_ms = now_ms()?;
+            session.last_wait_returned_at_ms = Some(now);
+            session.last_heartbeat_at_ms = now;
+            session.updated_at_ms = now;
             self.write_session(&session)
         })
     }
@@ -740,9 +1026,11 @@ impl ChatGptBackendStore {
     }
 
     fn write_session(&self, session: &BackendSession) -> Result<(), String> {
+        let mut persisted = session.clone();
+        compact_history(&mut persisted);
         let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)
             .map_err(|error| format!("create ChatGPT backend session temp file: {error}"))?;
-        serde_json::to_writer(&mut temporary, session)
+        serde_json::to_writer(&mut temporary, &persisted)
             .map_err(|error| format!("serialize ChatGPT backend session: {error}"))?;
         temporary
             .write_all(b"\n")
@@ -759,6 +1047,187 @@ impl ChatGptBackendStore {
 
     fn session_path(&self, session_id: &str) -> PathBuf {
         self.directory.join(format!("{session_id}.json"))
+    }
+}
+
+fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspection {
+    let stale_reason = session.stale_reason_at(now);
+    let state = session.lifecycle_state_at(now);
+    let tasks = session
+        .commands
+        .iter()
+        .filter(|command| command.kind == BackendCommandKind::Task)
+        .map(|command| {
+            let terminal = session.events.iter().find(|event| {
+                event.command_seq == Some(command.seq)
+                    && matches!(event.kind, BackendEventKind::Result | BackendEventKind::Error)
+            });
+            BackendTaskInspection {
+                command_seq: command.seq,
+                queued_at_ms: command.created_at_ms,
+                delivered_at_ms: command.delivered_at_ms,
+                acknowledged_at_ms: command.acknowledged_at_ms,
+                completed_at_ms: terminal.map(|event| event.created_at_ms),
+                outcome: terminal.map(|event| event.kind),
+                delivery_latency_ms: command
+                    .delivered_at_ms
+                    .map(|delivered| delivered.saturating_sub(command.created_at_ms)),
+                completion_latency_ms: terminal
+                    .map(|event| event.created_at_ms.saturating_sub(command.created_at_ms)),
+            }
+        })
+        .collect::<Vec<_>>();
+    let pending_commands = session
+        .commands
+        .iter()
+        .filter(|command| command.acknowledged_at_ms.is_none())
+        .count();
+    let retained_completed = session
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, BackendEventKind::Result | BackendEventKind::Error))
+        .count() as u64;
+    let retained_failed = session
+        .events
+        .iter()
+        .filter(|event| event.kind == BackendEventKind::Error)
+        .count() as u64;
+    let mut timeline = Vec::new();
+    for command in &session.commands {
+        timeline.push(BackendTimelineEntry {
+            at_ms: command.created_at_ms,
+            kind: "command_queued",
+            seq: command.seq,
+            command_seq: None,
+            command_kind: Some(command.kind),
+            event_kind: None,
+        });
+        if let Some(at_ms) = command.delivered_at_ms {
+            timeline.push(BackendTimelineEntry {
+                at_ms,
+                kind: "command_delivered",
+                seq: command.seq,
+                command_seq: None,
+                command_kind: Some(command.kind),
+                event_kind: None,
+            });
+        }
+        if let Some(at_ms) = command.acknowledged_at_ms {
+            timeline.push(BackendTimelineEntry {
+                at_ms,
+                kind: "command_acknowledged",
+                seq: command.seq,
+                command_seq: None,
+                command_kind: Some(command.kind),
+                event_kind: None,
+            });
+        }
+    }
+    for event in &session.events {
+        timeline.push(BackendTimelineEntry {
+            at_ms: event.created_at_ms,
+            kind: "event",
+            seq: event.seq,
+            command_seq: event.command_seq,
+            command_kind: None,
+            event_kind: Some(event.kind),
+        });
+    }
+    timeline.sort_by_key(|entry| (entry.at_ms, entry.kind, entry.seq));
+    BackendSessionInspection {
+        session_id: session.id.clone(),
+        live: !matches!(
+            state,
+            BackendLifecycleState::Finished
+                | BackendLifecycleState::Failed
+                | BackendLifecycleState::Stale
+        ),
+        state,
+        last_activity_at_ms: session.last_activity_at_ms(),
+        stale_reason,
+        retained_commands: session.commands.len(),
+        retained_events: session.events.len(),
+        pending_commands,
+        completed_tasks: session.completed_tasks.max(retained_completed),
+        failed_tasks: session.failed_tasks.max(retained_failed),
+        idempotent_retries: session.idempotent_retries,
+        dropped_commands: session.dropped_commands,
+        dropped_events: session.dropped_events,
+        next_command_seq: session.next_command_seq,
+        next_event_seq: session.next_event_seq,
+        active_task_seq: session.active_task_seq,
+        waiting: session.waiting,
+        workspace: session.workspace.clone(),
+        last_event: session.events.last().map(|event| BackendEventSummary {
+            seq: event.seq,
+            kind: event.kind,
+            command_seq: event.command_seq,
+            created_at_ms: event.created_at_ms,
+        }),
+        tasks,
+        timeline,
+    }
+}
+
+fn mark_session_stale_if_expired(session: &mut BackendSession, now: u64) -> bool {
+    if session.closed_at_ms.is_some()
+        || session.failed_at_ms.is_some()
+        || session.stale_at_ms.is_some()
+    {
+        return false;
+    }
+    if let Some(reason) = session.stale_reason_at(now) {
+        session.stale_at_ms = Some(now);
+        session.stale_reason = Some(reason);
+        session.waiting = false;
+        session.updated_at_ms = now;
+        return true;
+    }
+    false
+}
+
+fn compact_history(session: &mut BackendSession) {
+    // Older experimental records predate durable counters. Recover their totals
+    // before pruning so the first write under the new format does not lose the
+    // historical completion/error counts.
+    if session.completed_tasks == 0 {
+        session.completed_tasks = session
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, BackendEventKind::Result | BackendEventKind::Error))
+            .count() as u64;
+    }
+    if session.failed_tasks == 0 {
+        session.failed_tasks = session
+            .events
+            .iter()
+            .filter(|event| event.kind == BackendEventKind::Error)
+            .count() as u64;
+    }
+
+    let mut acknowledged = session
+        .commands
+        .iter()
+        .filter(|command| command.acknowledged_at_ms.is_some())
+        .map(|command| command.seq)
+        .collect::<Vec<_>>();
+    acknowledged.sort_unstable();
+    let drop_count = acknowledged.len().saturating_sub(MAX_RETAINED_COMMANDS);
+    if drop_count > 0 {
+        let drop_through = acknowledged[drop_count - 1];
+        let before = session.commands.len();
+        session.commands.retain(|command| {
+            command.acknowledged_at_ms.is_none() || command.seq > drop_through
+        });
+        session.dropped_commands = session
+            .dropped_commands
+            .saturating_add((before - session.commands.len()) as u64);
+    }
+
+    if session.events.len() > MAX_RETAINED_EVENTS {
+        let remove = session.events.len() - MAX_RETAINED_EVENTS;
+        session.events.drain(0..remove);
+        session.dropped_events = session.dropped_events.saturating_add(remove as u64);
     }
 }
 
@@ -835,7 +1304,7 @@ pub fn run_sessions_cli(
     args: crate::config::ChatGptBackendSessionsArgs,
 ) -> anyhow::Result<()> {
     let store = ChatGptBackendStore::for_current_user(config).map_err(anyhow::Error::msg)?;
-    let sessions = store.list().map_err(anyhow::Error::msg)?;
+    let sessions = store.list_inspections().map_err(anyhow::Error::msg)?;
     if args.json {
         crate::terminal::write_stdout(&format!("{}\n", serde_json::to_string_pretty(&sessions)?))?;
         return Ok(());
@@ -844,14 +1313,22 @@ pub fn run_sessions_cli(
         crate::terminal::write_stdout("No ChatGPT backend sessions.\n")?;
         return Ok(());
     }
-    for session in sessions {
+    for inspection in sessions {
+        let workspace = inspection
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.active_root.as_str())
+            .unwrap_or("-");
         crate::terminal::write_stdout(&format!(
-            "{}\t{}\tworker={}\tcommands={}\tevents={}\n",
-            session.id,
-            session.state(),
-            &session.worker[..session.worker.len().min(12)],
-            session.commands.len(),
-            session.events.len()
+            "{}\t{}\tlive={}\tworkspace={}\tcommands={}+{}d\tevents={}+{}d\n",
+            inspection.session_id,
+            inspection.state.as_str(),
+            inspection.live,
+            workspace,
+            inspection.retained_commands,
+            inspection.dropped_commands,
+            inspection.retained_events,
+            inspection.dropped_events
         ))?;
     }
     Ok(())
@@ -882,25 +1359,53 @@ pub fn run_status_cli(
     args: crate::config::ChatGptBackendStatusArgs,
 ) -> anyhow::Result<()> {
     let store = ChatGptBackendStore::for_current_user(config).map_err(anyhow::Error::msg)?;
-    let session = store.session(&args.session_id).map_err(anyhow::Error::msg)?;
+    let inspection = store.inspection(&args.session_id).map_err(anyhow::Error::msg)?;
     if args.json {
-        crate::terminal::write_stdout(&format!("{}\n", serde_json::to_string_pretty(&session)?))?;
+        crate::terminal::write_stdout(&format!("{}\n", serde_json::to_string_pretty(&inspection)?))?;
     } else {
         crate::terminal::write_stdout(&format!(
-            "session={} state={} worker={} commands={} events={} active_task={:?} waiting={}\n",
-            session.id,
-            session.state(),
-            &session.worker[..session.worker.len().min(12)],
-            session.commands.len(),
-            session.events.len(),
-            session.active_task_seq,
-            session.waiting
+            "session={} state={} live={} commands={}+{}d events={}+{}d active_task={:?} waiting={} last_activity_at_ms={} completed={} failed={} retries={}\n",
+            inspection.session_id,
+            inspection.state.as_str(),
+            inspection.live,
+            inspection.retained_commands,
+            inspection.dropped_commands,
+            inspection.retained_events,
+            inspection.dropped_events,
+            inspection.active_task_seq,
+            inspection.waiting,
+            inspection.last_activity_at_ms,
+            inspection.completed_tasks,
+            inspection.failed_tasks,
+            inspection.idempotent_retries
         ))?;
-        if let Some(event) = session.events.last() {
+        if let Some(reason) = &inspection.stale_reason {
+            crate::terminal::write_stdout(&format!("stale_reason={reason}\n"))?;
+        }
+        if let Some(workspace) = &inspection.workspace {
             crate::terminal::write_stdout(&format!(
-                "last_event seq={} kind={:?} command_seq={:?} content={}\n",
-                event.seq, event.kind, event.command_seq, event.content
+                "workspace={} managed_worktree={}\n",
+                workspace.active_root, workspace.managed_worktree
             ))?;
+        }
+        if let Some(event) = &inspection.last_event {
+            crate::terminal::write_stdout(&format!(
+                "last_event seq={} kind={:?} command_seq={:?} created_at_ms={}\n",
+                event.seq, event.kind, event.command_seq, event.created_at_ms
+            ))?;
+        }
+        if args.timeline {
+            for entry in &inspection.timeline {
+                crate::terminal::write_stdout(&format!(
+                    "timeline at_ms={} kind={} seq={} command_seq={:?} command_kind={:?} event_kind={:?}\n",
+                    entry.at_ms,
+                    entry.kind,
+                    entry.seq,
+                    entry.command_seq,
+                    entry.command_kind,
+                    entry.event_kind
+                ))?;
+            }
         }
     }
     Ok(())
@@ -966,6 +1471,121 @@ mod tests {
         assert!(error.contains("different workspace"));
     }
 
+    #[test]
+    fn expired_wait_is_marked_stale_and_fresh_attach_replaces_it() {
+        let (_root, store) = store();
+        let first = store.attach("worker-a").unwrap();
+        let mut persisted = store.session(&first.id).unwrap();
+        let now = now_ms().unwrap();
+        let expired = now
+            .saturating_sub(DEFAULT_WAIT_MS)
+            .saturating_sub(WAIT_LEASE_GRACE_MS)
+            .saturating_sub(1_000);
+        persisted.waiting = true;
+        persisted.last_wait_started_at_ms = Some(expired);
+        persisted.last_heartbeat_at_ms = expired;
+        persisted.updated_at_ms = expired;
+        store.write_session(&persisted).unwrap();
+
+        let stale = store.inspection(&first.id).unwrap();
+        assert_eq!(stale.state, BackendLifecycleState::Stale);
+        assert!(!stale.live);
+        assert_eq!(stale.stale_reason.as_deref(), Some("exchange wait lease expired"));
+
+        let replacement = store.attach("worker-a").unwrap();
+        assert_ne!(replacement.id, first.id);
+        assert_eq!(
+            store.inspection(&replacement.id).unwrap().state,
+            BackendLifecycleState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn active_tool_boundary_renews_working_heartbeat() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExchangeOutcome::Command(ref command) if command.seq == task.seq));
+
+        let mut persisted = store.session(&session.id).unwrap();
+        let old = now_ms().unwrap().saturating_sub(WORKING_STALE_MS + 1_000);
+        persisted.last_heartbeat_at_ms = old;
+        persisted.updated_at_ms = old;
+        store.write_session(&persisted).unwrap();
+
+        assert_eq!(
+            store.active_task_for_worker("worker-a").unwrap(),
+            Some((session.id.clone(), task.seq))
+        );
+        let inspection = store.inspection(&session.id).unwrap();
+        assert_eq!(inspection.state, BackendLifecycleState::Working);
+        assert!(inspection.live);
+        assert!(inspection.last_activity_at_ms > old);
+    }
+
+    #[tokio::test]
+    async fn completed_history_is_compacted_but_sequence_numbers_remain_monotonic() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+
+        for index in 0..40u64 {
+            let task = store
+                .enqueue_command(
+                    &session.id,
+                    BackendCommandKind::Task,
+                    format!("task-{index}"),
+                )
+                .unwrap();
+            let outcome = store
+                .exchange_wait(
+                    "worker-a",
+                    &session.id,
+                    false,
+                    0,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, ExchangeOutcome::Command(ref command) if command.seq == task.seq));
+            store
+                .prepare_exchange(
+                    "worker-a",
+                    &session.id,
+                    None,
+                    Some(ExchangeOutbound {
+                        kind: BackendEventKind::Result,
+                        command_seq: task.seq,
+                        content: format!("result-{index}"),
+                    }),
+                )
+                .unwrap();
+        }
+
+        let persisted = store.session(&session.id).unwrap();
+        assert_eq!(persisted.next_command_seq, 41);
+        assert_eq!(persisted.next_event_seq, 42);
+        assert!(persisted.commands.len() <= MAX_RETAINED_COMMANDS);
+        assert!(persisted.events.len() <= MAX_RETAINED_EVENTS);
+        assert!(persisted.dropped_commands > 0);
+        assert!(persisted.dropped_events > 0);
+        assert_eq!(persisted.completed_tasks, 40);
+        assert_eq!(persisted.failed_tasks, 0);
+        assert_eq!(persisted.commands.last().unwrap().seq, 40);
+        assert_eq!(persisted.events.last().unwrap().command_seq, Some(40));
+    }
+
     #[tokio::test]
     async fn task_result_round_trip_preserves_sequence_and_single_flight() {
         let (_root, store) = store();
@@ -1018,6 +1638,65 @@ mod tests {
         assert_eq!(session.active_task_seq, None);
         assert_eq!(session.events.last().unwrap().content, "done");
         assert!(session.commands[0].acknowledged_at_ms.is_some());
+        assert_eq!(session.completed_tasks, 1);
+        assert_eq!(session.failed_tasks, 0);
+        assert_eq!(session.idempotent_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn inspection_exposes_control_plane_timeline_without_payloads_or_worker_identity() {
+        let (_root, store) = store();
+        let session = store.attach("worker-secret-identity").unwrap();
+        let task = store
+            .enqueue_command(
+                &session.id,
+                BackendCommandKind::Task,
+                "TOP_SECRET_PROMPT".into(),
+            )
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-secret-identity",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        store
+            .prepare_exchange(
+                "worker-secret-identity",
+                &session.id,
+                None,
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Result,
+                    command_seq: task.seq,
+                    content: "TOP_SECRET_RESULT".into(),
+                }),
+            )
+            .unwrap();
+
+        let inspection = store.inspection(&session.id).unwrap();
+        assert_eq!(inspection.completed_tasks, 1);
+        assert_eq!(inspection.failed_tasks, 0);
+        assert!(
+            inspection
+                .timeline
+                .iter()
+                .any(|entry| entry.kind == "command_delivered" && entry.seq == task.seq)
+        );
+        assert!(
+            inspection.timeline.iter().any(|entry| {
+                entry.kind == "event"
+                    && entry.command_seq == Some(task.seq)
+                    && entry.event_kind == Some(BackendEventKind::Result)
+            })
+        );
+        let json = serde_json::to_string(&inspection).unwrap();
+        assert!(!json.contains("worker-secret-identity"));
+        assert!(!json.contains("TOP_SECRET_PROMPT"));
+        assert!(!json.contains("TOP_SECRET_RESULT"));
     }
 
     #[test]
