@@ -612,7 +612,12 @@ fn run_view(
             .map(|event| event.content.clone()),
         error: terminal
             .filter(|event| event.kind == BackendEventKind::Error)
-            .map(|event| event.content.clone()),
+            .map(|event| event.content.clone())
+            .or_else(|| {
+                (state == BackendRunState::Stale)
+                    .then(|| inspection.stale_reason.clone())
+                    .flatten()
+            }),
     }
 }
 
@@ -802,10 +807,9 @@ mod tests {
             .abandon(&session.id, Some("interrupt timed out".into()))
             .unwrap();
         assert_eq!(receipt.action, "abandon");
-        assert_eq!(
-            adapter.run(&session.id, &run.run_id).unwrap().state,
-            BackendRunState::Stale
-        );
+        let abandoned = adapter.run(&session.id, &run.run_id).unwrap();
+        assert_eq!(abandoned.state, BackendRunState::Stale);
+        assert_eq!(abandoned.error.as_deref(), Some("interrupt timed out"));
         assert!(!adapter.session(&session.id).unwrap().live);
     }
 
