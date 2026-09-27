@@ -181,6 +181,12 @@ pub enum CliCommand {
         #[command(subcommand)]
         command: ChatGptBridgeCommand,
     },
+    /// Control long-lived ChatGPT coding backends through the stable controller API.
+    #[command(name = "chatgpt-backend")]
+    ChatGptBackend {
+        #[command(subcommand)]
+        command: ChatGptBackendCommand,
+    },
     /// Inspect the read-only project catalogue used by multi-project mode.
     Projects {
         #[command(subcommand)]
@@ -210,6 +216,75 @@ pub enum ChatGptBridgeCommand {
     Send(ChatGptBackendSendArgs),
     /// Inspect one long-lived ChatGPT coding-backend session.
     Status(ChatGptBackendStatusArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChatGptBackendCommand {
+    /// List controller-visible ChatGPT backend sessions.
+    Sessions,
+    /// Acquire the freshest ready backend, optionally for one exact workspace.
+    Acquire(ChatGptBackendAcquireArgs),
+    /// Inspect one backend session, including its bounded control-plane timeline.
+    Status(ChatGptBackendControllerSessionArgs),
+    /// Submit one coding task to a ready backend session.
+    Submit(ChatGptBackendSubmitArgs),
+    /// Inspect one submitted backend run.
+    Run(ChatGptBackendRunArgs),
+    /// Wait for one backend run to reach a terminal state.
+    Wait(ChatGptBackendWaitArgs),
+    /// Steer one active backend run.
+    Steer(ChatGptBackendSteerArgs),
+    /// Cancel one active backend run.
+    Cancel(ChatGptBackendCancelArgs),
+    /// Finish and release one idle backend session.
+    Finish(ChatGptBackendControllerSessionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendAcquireArgs {
+    /// Require an exact active workspace path.
+    #[arg(long)]
+    pub workspace: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendControllerSessionArgs {
+    pub session_id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSubmitArgs {
+    pub session_id: String,
+    pub prompt: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendRunArgs {
+    pub session_id: String,
+    pub run_id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendWaitArgs {
+    pub session_id: String,
+    pub run_id: String,
+    /// Maximum time to wait for the terminal backend result.
+    #[arg(long, default_value_t = 300)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSteerArgs {
+    pub session_id: String,
+    pub run_id: String,
+    pub instruction: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendCancelArgs {
+    pub session_id: String,
+    pub run_id: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -3228,6 +3303,49 @@ mod tests {
         };
         assert_eq!(args.query.as_deref(), Some("bridge"));
         assert!(args.json);
+    }
+
+    #[test]
+    fn chatgpt_backend_cli_parses_controller_commands() {
+        let parsed = Cli::try_parse_from([
+            "codexify",
+            "chatgpt-backend",
+            "wait",
+            "session-1",
+            "run-1",
+            "--timeout-seconds",
+            "42",
+            "--config",
+            "/tmp/codexify.config.json",
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.config.as_deref(), Some("/tmp/codexify.config.json"));
+        let Some(CliCommand::ChatGptBackend {
+            command: ChatGptBackendCommand::Wait(args),
+        }) = parsed.command
+        else {
+            panic!("chatgpt-backend wait subcommand was not parsed");
+        };
+        assert_eq!(args.session_id, "session-1");
+        assert_eq!(args.run_id, "run-1");
+        assert_eq!(args.timeout_seconds, 42);
+
+        let parsed = Cli::try_parse_from([
+            "codexify",
+            "chatgpt-backend",
+            "acquire",
+            "--workspace",
+            "/tmp/project",
+        ])
+        .unwrap();
+        let Some(CliCommand::ChatGptBackend {
+            command: ChatGptBackendCommand::Acquire(args),
+        }) = parsed.command
+        else {
+            panic!("chatgpt-backend acquire subcommand was not parsed");
+        };
+        assert_eq!(args.workspace.as_deref(), Some("/tmp/project"));
     }
 
     #[test]

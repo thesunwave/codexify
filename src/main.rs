@@ -6,8 +6,9 @@ use serde::Serialize;
 
 use anyhow::Context;
 use codexify::config::{
-    ChatGptBridgeCommand, Cli, CliCommand, ProjectsCommand, ProjectsListArgs, ServiceCommand,
-    config_path_for_quickstart, config_path_for_service, load_config, load_project_catalog_for_cli,
+    ChatGptBackendCommand, ChatGptBridgeCommand, Cli, CliCommand, ProjectsCommand,
+    ProjectsListArgs, ServiceCommand, config_path_for_quickstart, config_path_for_service,
+    load_config, load_config_quiet, load_project_catalog_for_cli,
 };
 use codexify::doctor;
 use codexify::legacy_migration;
@@ -39,6 +40,65 @@ fn trust_name(trust: Option<ProjectTrustLevel>) -> &'static str {
         Some(ProjectTrustLevel::Trusted) => "trusted",
         Some(ProjectTrustLevel::Untrusted) => "untrusted",
         None => "explicit",
+    }
+}
+
+fn write_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    codexify::terminal::write_stdout(&format!("{}\n", serde_json::to_string(value)?))?;
+    Ok(())
+}
+
+async fn run_chatgpt_backend(cli: Cli, command: ChatGptBackendCommand) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    let config = load_config_quiet(cli).map_err(anyhow::Error::msg)?;
+    let adapter = codexify::chatgpt_backend_adapter::ChatGptBackendAdapter::for_current_user(&config)
+        .map_err(anyhow::Error::new)?;
+    match command {
+        ChatGptBackendCommand::Sessions => write_json(&adapter.sessions().map_err(anyhow::Error::new)?),
+        ChatGptBackendCommand::Acquire(args) => write_json(
+            &adapter
+                .acquire(args.workspace.as_deref())
+                .map_err(anyhow::Error::new)?,
+        ),
+        ChatGptBackendCommand::Status(args) => {
+            write_json(&adapter.status(&args.session_id).map_err(anyhow::Error::new)?)
+        }
+        ChatGptBackendCommand::Submit(args) => write_json(
+            &adapter
+                .submit_task(&args.session_id, args.prompt)
+                .map_err(anyhow::Error::new)?,
+        ),
+        ChatGptBackendCommand::Run(args) => write_json(
+            &adapter
+                .run(&args.session_id, &args.run_id)
+                .map_err(anyhow::Error::new)?,
+        ),
+        ChatGptBackendCommand::Wait(args) => write_json(
+            &adapter
+                .wait_run(
+                    &args.session_id,
+                    &args.run_id,
+                    Duration::from_secs(args.timeout_seconds),
+                )
+                .await
+                .map_err(anyhow::Error::new)?,
+        ),
+        ChatGptBackendCommand::Steer(args) => write_json(
+            &adapter
+                .steer(&args.session_id, &args.run_id, args.instruction)
+                .map_err(anyhow::Error::new)?,
+        ),
+        ChatGptBackendCommand::Cancel(args) => write_json(
+            &adapter
+                .cancel(&args.session_id, &args.run_id, args.reason)
+                .map_err(anyhow::Error::new)?,
+        ),
+        ChatGptBackendCommand::Finish(args) => write_json(
+            &adapter
+                .finish(&args.session_id)
+                .map_err(anyhow::Error::new)?,
+        ),
     }
 }
 
@@ -152,10 +212,20 @@ async fn main() {
     codexify::tls::ensure_crypto_provider();
 
     if let Err(error) = run(Cli::parse()).await {
-        let message = format!(
-            "{} {error:#}\n",
-            codexify::terminal::paint(codexify::terminal::FAILURE, "Error:")
-        );
+        let message = if let Some(adapter_error) =
+            error.downcast_ref::<codexify::chatgpt_backend_adapter::BackendAdapterError>()
+        {
+            format!(
+                "{}\n",
+                serde_json::to_string(adapter_error)
+                    .unwrap_or_else(|_| "{\"code\":\"internal\",\"message\":\"failed to serialize backend error\"}".into())
+            )
+        } else {
+            format!(
+                "{} {error:#}\n",
+                codexify::terminal::paint(codexify::terminal::FAILURE, "Error:")
+            )
+        };
         if codexify::terminal::write_stderr(&message).is_err() {
             eprintln!("Error: {error:#}");
         }
@@ -202,6 +272,9 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
                         codexify::chatgpt_backend::run_status_cli(&config, args)
                     }
                 };
+            }
+            CliCommand::ChatGptBackend { command } => {
+                return run_chatgpt_backend(cli, command).await;
             }
             CliCommand::Projects {
                 command: ProjectsCommand::List(args),

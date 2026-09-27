@@ -1,0 +1,647 @@
+use serde::Serialize;
+use std::time::Duration;
+
+use crate::chatgpt_backend::{
+    BackendCommand, BackendCommandKind, BackendEventKind, BackendLifecycleState, BackendSession,
+    BackendSessionInspection, BackendTaskInspection, BackendTimelineEntry, BackendWorkspace,
+    ChatGptBackendStore,
+};
+use crate::types::AppConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendAdapterErrorCode {
+    InvalidArgument,
+    NotFound,
+    Unavailable,
+    Busy,
+    Conflict,
+    TimedOut,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendAdapterError {
+    pub code: BackendAdapterErrorCode,
+    pub message: String,
+}
+
+impl BackendAdapterError {
+    fn new(code: BackendAdapterErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn from_store(message: String) -> Self {
+        let code = if message.contains("unknown ChatGPT backend session") {
+            BackendAdapterErrorCode::NotFound
+        } else if message.contains("already active or queued")
+            || message.contains("requires an active or queued task")
+        {
+            BackendAdapterErrorCode::Busy
+        } else if message.contains("stale") || message.contains("closed") {
+            BackendAdapterErrorCode::Unavailable
+        } else if message.contains("different workspace") {
+            BackendAdapterErrorCode::Conflict
+        } else if message.contains("invalid") || message.contains("must not be empty") {
+            BackendAdapterErrorCode::InvalidArgument
+        } else {
+            BackendAdapterErrorCode::Internal
+        };
+        Self::new(code, message)
+    }
+}
+
+impl std::fmt::Display for BackendAdapterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BackendAdapterError {}
+
+pub type BackendAdapterResult<T> = Result<T, BackendAdapterError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendRunState {
+    Queued,
+    Running,
+    Cancelling,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatGptBackendSessionView {
+    pub session_id: String,
+    pub state: BackendLifecycleState,
+    pub live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<BackendWorkspace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_run_id: Option<String>,
+    pub pending_commands: usize,
+    pub completed_tasks: u64,
+    pub failed_tasks: u64,
+    pub last_activity_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatGptBackendStatusView {
+    pub session: ChatGptBackendSessionView,
+    pub tasks: Vec<BackendTaskInspection>,
+    pub timeline: Vec<BackendTimelineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatGptBackendRunView {
+    pub session_id: String,
+    pub run_id: String,
+    pub state: BackendRunState,
+    pub queued_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendControlReceipt {
+    pub accepted: bool,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub action: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatGptBackendAdapter {
+    store: ChatGptBackendStore,
+}
+
+impl ChatGptBackendAdapter {
+    pub fn for_current_user(config: &AppConfig) -> BackendAdapterResult<Self> {
+        Ok(Self {
+            store: ChatGptBackendStore::for_current_user(config)
+                .map_err(BackendAdapterError::from_store)?,
+        })
+    }
+
+    pub fn new_at(directory: std::path::PathBuf) -> Self {
+        Self {
+            store: ChatGptBackendStore::new_at(directory),
+        }
+    }
+
+    pub fn sessions(&self) -> BackendAdapterResult<Vec<ChatGptBackendSessionView>> {
+        self.store
+            .list_inspections()
+            .map_err(BackendAdapterError::from_store)?
+            .into_iter()
+            .map(|inspection| self.session_view(inspection))
+            .collect()
+    }
+
+    pub fn session(&self, session_id: &str) -> BackendAdapterResult<ChatGptBackendSessionView> {
+        let inspection = self
+            .store
+            .inspection(session_id)
+            .map_err(BackendAdapterError::from_store)?;
+        self.session_view(inspection)
+    }
+
+    pub fn status(&self, session_id: &str) -> BackendAdapterResult<ChatGptBackendStatusView> {
+        let inspection = self
+            .store
+            .inspection(session_id)
+            .map_err(BackendAdapterError::from_store)?;
+        let tasks = inspection.tasks.clone();
+        let timeline = inspection.timeline.clone();
+        Ok(ChatGptBackendStatusView {
+            session: self.session_view(inspection)?,
+            tasks,
+            timeline,
+        })
+    }
+
+    /// Select the freshest available ChatGPT worker, optionally pinned to one
+    /// exact active workspace. The adapter never creates a ChatGPT turn itself;
+    /// an operator/bootstrap flow must have attached a worker first.
+    pub fn acquire(
+        &self,
+        workspace: Option<&str>,
+    ) -> BackendAdapterResult<ChatGptBackendSessionView> {
+        let mut candidates = self
+            .store
+            .list_inspections()
+            .map_err(BackendAdapterError::from_store)?
+            .into_iter()
+            .filter(|inspection| {
+                inspection.live
+                    && matches!(
+                        inspection.state,
+                        BackendLifecycleState::Ready | BackendLifecycleState::Waiting
+                    )
+                    && workspace.is_none_or(|expected| {
+                        inspection
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|actual| actual.active_root == expected)
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|inspection| inspection.last_activity_at_ms);
+        let inspection = candidates.pop().ok_or_else(|| {
+            BackendAdapterError::new(
+                BackendAdapterErrorCode::Unavailable,
+                match workspace {
+                    Some(workspace) => format!(
+                        "no ready ChatGPT backend session is available for workspace {workspace}"
+                    ),
+                    None => "no ready ChatGPT backend session is available".to_string(),
+                },
+            )
+        })?;
+        self.session_view(inspection)
+    }
+
+    pub fn submit_task(
+        &self,
+        session_id: &str,
+        prompt: String,
+    ) -> BackendAdapterResult<ChatGptBackendRunView> {
+        let session = self.session(session_id)?;
+        if !session.live {
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::Unavailable,
+                format!(
+                    "ChatGPT backend session {session_id} is not live ({:?})",
+                    session.state
+                ),
+            ));
+        }
+        if !matches!(
+            session.state,
+            BackendLifecycleState::Ready | BackendLifecycleState::Waiting
+        ) {
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::Busy,
+                format!(
+                    "ChatGPT backend session {session_id} is not ready for a new task ({:?})",
+                    session.state
+                ),
+            ));
+        }
+        let command = self
+            .store
+            .enqueue_command(session_id, BackendCommandKind::Task, prompt)
+            .map_err(BackendAdapterError::from_store)?;
+        self.run(session_id, &command.id)
+    }
+
+    pub fn run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> BackendAdapterResult<ChatGptBackendRunView> {
+        let session = self
+            .store
+            .session(session_id)
+            .map_err(BackendAdapterError::from_store)?;
+        let inspection = self
+            .store
+            .inspection(session_id)
+            .map_err(BackendAdapterError::from_store)?;
+        let task = find_task(&session, run_id)?;
+        Ok(run_view(&session, &inspection, task))
+    }
+
+    pub async fn wait_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        timeout: Duration,
+    ) -> BackendAdapterResult<ChatGptBackendRunView> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let run = self.run(session_id, run_id)?;
+            if matches!(
+                run.state,
+                BackendRunState::Succeeded
+                    | BackendRunState::Failed
+                    | BackendRunState::Cancelled
+                    | BackendRunState::Stale
+            ) {
+                return Ok(run);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BackendAdapterError::new(
+                    BackendAdapterErrorCode::TimedOut,
+                    format!("timed out waiting for backend run {run_id}"),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub fn steer(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        instruction: String,
+    ) -> BackendAdapterResult<BackendControlReceipt> {
+        self.require_active_run(session_id, run_id)?;
+        self.store
+            .enqueue_command(session_id, BackendCommandKind::Steer, instruction)
+            .map_err(BackendAdapterError::from_store)?;
+        Ok(BackendControlReceipt {
+            accepted: true,
+            session_id: session_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            action: "steer",
+        })
+    }
+
+    pub fn cancel(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        reason: Option<String>,
+    ) -> BackendAdapterResult<BackendControlReceipt> {
+        self.require_active_run(session_id, run_id)?;
+        self.store
+            .enqueue_command(
+                session_id,
+                BackendCommandKind::Cancel,
+                reason.unwrap_or_default(),
+            )
+            .map_err(BackendAdapterError::from_store)?;
+        Ok(BackendControlReceipt {
+            accepted: true,
+            session_id: session_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            action: "cancel",
+        })
+    }
+
+    pub fn finish(&self, session_id: &str) -> BackendAdapterResult<BackendControlReceipt> {
+        let session = self
+            .store
+            .session(session_id)
+            .map_err(BackendAdapterError::from_store)?;
+        if session.active_task_seq.is_some()
+            || session.commands.iter().any(|command| {
+                command.kind == BackendCommandKind::Task && command.acknowledged_at_ms.is_none()
+            })
+        {
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::Busy,
+                "cannot finish a ChatGPT backend session while a task is active or queued",
+            ));
+        }
+        self.store
+            .enqueue_command(session_id, BackendCommandKind::Finish, String::new())
+            .map_err(BackendAdapterError::from_store)?;
+        Ok(BackendControlReceipt {
+            accepted: true,
+            session_id: session_id.to_string(),
+            run_id: None,
+            action: "finish",
+        })
+    }
+
+    fn require_active_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> BackendAdapterResult<()> {
+        let session = self
+            .store
+            .session(session_id)
+            .map_err(BackendAdapterError::from_store)?;
+        let task = find_task(&session, run_id)?;
+        if session.active_task_seq == Some(task.seq)
+            || (task.delivered_at_ms.is_none() && task.acknowledged_at_ms.is_none())
+        {
+            Ok(())
+        } else {
+            Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::Conflict,
+                format!("backend run {run_id} is no longer active"),
+            ))
+        }
+    }
+
+    fn session_view(
+        &self,
+        inspection: BackendSessionInspection,
+    ) -> BackendAdapterResult<ChatGptBackendSessionView> {
+        let raw = self
+            .store
+            .session(&inspection.session_id)
+            .map_err(BackendAdapterError::from_store)?;
+        let active_run_id = raw.active_task_seq.and_then(|seq| {
+            raw.commands
+                .iter()
+                .find(|command| command.seq == seq && command.kind == BackendCommandKind::Task)
+                .map(|command| command.id.clone())
+        });
+        Ok(ChatGptBackendSessionView {
+            session_id: inspection.session_id,
+            state: inspection.state,
+            live: inspection.live,
+            workspace: inspection.workspace,
+            active_run_id,
+            pending_commands: inspection.pending_commands,
+            completed_tasks: inspection.completed_tasks,
+            failed_tasks: inspection.failed_tasks,
+            last_activity_at_ms: inspection.last_activity_at_ms,
+        })
+    }
+}
+
+fn find_task<'a>(session: &'a BackendSession, run_id: &str) -> BackendAdapterResult<&'a BackendCommand> {
+    session
+        .commands
+        .iter()
+        .find(|command| command.kind == BackendCommandKind::Task && command.id == run_id)
+        .ok_or_else(|| {
+            BackendAdapterError::new(
+                BackendAdapterErrorCode::NotFound,
+                format!("unknown backend run {run_id} in session {}", session.id),
+            )
+        })
+}
+
+fn run_view(
+    session: &BackendSession,
+    inspection: &BackendSessionInspection,
+    task: &BackendCommand,
+) -> ChatGptBackendRunView {
+    let terminal = session.events.iter().find(|event| {
+        event.command_seq == Some(task.seq)
+            && matches!(event.kind, BackendEventKind::Result | BackendEventKind::Error)
+    });
+    let cancelled = session.commands.iter().any(|command| {
+        command.kind == BackendCommandKind::Cancel
+            && command.target_task_seq == Some(task.seq)
+            && command.acknowledged_at_ms.is_some()
+    });
+    let cancelling = session.commands.iter().any(|command| {
+        command.kind == BackendCommandKind::Cancel
+            && command.target_task_seq == Some(task.seq)
+            && command.acknowledged_at_ms.is_none()
+    });
+
+    let state = match terminal.map(|event| event.kind) {
+        Some(BackendEventKind::Result) => BackendRunState::Succeeded,
+        Some(BackendEventKind::Error) if cancelled => BackendRunState::Cancelled,
+        Some(BackendEventKind::Error) => BackendRunState::Failed,
+        Some(BackendEventKind::Ready) => unreachable!("ready is not a terminal task event"),
+        None if inspection.state == BackendLifecycleState::Stale => BackendRunState::Stale,
+        None if cancelling => BackendRunState::Cancelling,
+        None if task.delivered_at_ms.is_some() => BackendRunState::Running,
+        None => BackendRunState::Queued,
+    };
+
+    ChatGptBackendRunView {
+        session_id: session.id.clone(),
+        run_id: task.id.clone(),
+        state,
+        queued_at_ms: task.created_at_ms,
+        started_at_ms: task.delivered_at_ms,
+        completed_at_ms: terminal.map(|event| event.created_at_ms),
+        result: terminal
+            .filter(|event| event.kind == BackendEventKind::Result)
+            .map(|event| event.content.clone()),
+        error: terminal
+            .filter(|event| event.kind == BackendEventKind::Error)
+            .map(|event| event.content.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chatgpt_backend::{ExchangeOutbound, ExchangeOutcome};
+    use tokio_util::sync::CancellationToken;
+
+    fn adapter() -> (tempfile::TempDir, ChatGptBackendAdapter, ChatGptBackendStore) {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("backend");
+        (
+            root,
+            ChatGptBackendAdapter::new_at(directory.clone()),
+            ChatGptBackendStore::new_at(directory),
+        )
+    }
+
+    #[tokio::test]
+    async fn adapter_maps_task_result_without_exposing_command_sequence_to_caller() {
+        let (_root, adapter, store) = adapter();
+        let session = store.attach("worker-a").unwrap();
+        let acquired = adapter.acquire(None).unwrap();
+        assert_eq!(acquired.session_id, session.id);
+
+        let queued = adapter
+            .submit_task(&session.id, "implement the change".into())
+            .unwrap();
+        assert_eq!(queued.state, BackendRunState::Queued);
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let command = match outcome {
+            ExchangeOutcome::Command(command) => command,
+            other => panic!("expected task command, got {other:?}"),
+        };
+        assert_eq!(command.id, queued.run_id);
+        assert_eq!(
+            adapter.run(&session.id, &queued.run_id).unwrap().state,
+            BackendRunState::Running
+        );
+
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                None,
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Result,
+                    command_seq: command.seq,
+                    content: "done".into(),
+                }),
+            )
+            .unwrap();
+        let finished = adapter.run(&session.id, &queued.run_id).unwrap();
+        assert_eq!(finished.state, BackendRunState::Succeeded);
+        assert_eq!(finished.result.as_deref(), Some("done"));
+        assert!(finished.error.is_none());
+
+        let waited = adapter
+            .wait_run(&session.id, &queued.run_id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(waited.state, BackendRunState::Succeeded);
+        assert_eq!(waited.result.as_deref(), Some("done"));
+
+        let status = adapter.status(&session.id).unwrap();
+        assert_eq!(status.session.session_id, session.id);
+        assert!(status.timeline.iter().any(|entry| {
+            entry.kind == "event" && entry.command_seq == Some(command.seq)
+        }));
+    }
+
+    #[tokio::test]
+    async fn wait_run_times_out_without_exposing_bridge_details() {
+        let (_root, adapter, store) = adapter();
+        let session = store.attach("worker-a").unwrap();
+        let run = adapter.submit_task(&session.id, "work".into()).unwrap();
+        let error = adapter
+            .wait_run(&session.id, &run.run_id, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, BackendAdapterErrorCode::TimedOut);
+        assert!(error.message.contains(&run.run_id));
+        assert!(!error.message.contains("chatgpt_backend_exchange"));
+    }
+
+    #[tokio::test]
+    async fn adapter_maps_steer_cancel_and_cancelled_terminal_state() {
+        let (_root, adapter, store) = adapter();
+        let session = store.attach("worker-a").unwrap();
+        let run = adapter.submit_task(&session.id, "long work".into()).unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let task = match outcome {
+            ExchangeOutcome::Command(command) => command,
+            other => panic!("expected task command, got {other:?}"),
+        };
+
+        let steer = adapter
+            .steer(&session.id, &run.run_id, "change direction".into())
+            .unwrap();
+        assert_eq!(steer.action, "steer");
+        let control = store.pending_control_for_worker("worker-a").unwrap().unwrap().1;
+        store
+            .prepare_exchange("worker-a", &session.id, Some(control.seq), None)
+            .unwrap();
+
+        let cancel = adapter
+            .cancel(&session.id, &run.run_id, Some("stop".into()))
+            .unwrap();
+        assert_eq!(cancel.action, "cancel");
+        assert_eq!(
+            adapter.run(&session.id, &run.run_id).unwrap().state,
+            BackendRunState::Cancelling
+        );
+        let cancel_command = store.pending_control_for_worker("worker-a").unwrap().unwrap().1;
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                Some(cancel_command.seq),
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Error,
+                    command_seq: task.seq,
+                    content: "cancelled".into(),
+                }),
+            )
+            .unwrap();
+        let cancelled = adapter.run(&session.id, &run.run_id).unwrap();
+        assert_eq!(cancelled.state, BackendRunState::Cancelled);
+        assert_eq!(cancelled.error.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn acquire_filters_workspace_and_finish_rejects_busy_session() {
+        let (_root, adapter, store) = adapter();
+        let workspace = BackendWorkspace {
+            active_root: "/workspace/a".into(),
+            source_project_root: Some("/workspace/a".into()),
+            managed_worktree: false,
+            worktree_git_root: None,
+            repository_url: None,
+        };
+        let session = store
+            .attach_with_workspace("worker-a", Some(workspace))
+            .unwrap();
+        assert_eq!(
+            adapter.acquire(Some("/workspace/a")).unwrap().session_id,
+            session.id
+        );
+        assert_eq!(
+            adapter.acquire(Some("/workspace/b")).unwrap_err().code,
+            BackendAdapterErrorCode::Unavailable
+        );
+        let run = adapter.submit_task(&session.id, "work".into()).unwrap();
+        assert_eq!(
+            adapter.finish(&session.id).unwrap_err().code,
+            BackendAdapterErrorCode::Busy
+        );
+        assert_eq!(run.state, BackendRunState::Queued);
+    }
+}
