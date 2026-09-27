@@ -238,7 +238,7 @@ impl BackendSession {
     }
 
     fn last_activity_at_ms(&self) -> u64 {
-        self.last_heartbeat_at_ms.max(self.updated_at_ms)
+        self.last_heartbeat_at_ms
     }
 
     fn pending_cancel_for_active_task(&self) -> bool {
@@ -1533,6 +1533,45 @@ mod tests {
         assert_eq!(inspection.state, BackendLifecycleState::Working);
         assert!(inspection.live);
         assert!(inspection.last_activity_at_ms > old);
+    }
+
+    #[tokio::test]
+    async fn queued_controls_do_not_keep_an_unresponsive_worker_live() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExchangeOutcome::Command(ref command) if command.seq == task.seq));
+
+        store
+            .enqueue_command(&session.id, BackendCommandKind::Cancel, "stop".into())
+            .unwrap();
+        let mut persisted = store.session(&session.id).unwrap();
+        let externally_updated_at = persisted.updated_at_ms;
+        let expired = now_ms().unwrap().saturating_sub(WORKING_STALE_MS + 1_000);
+        persisted.last_heartbeat_at_ms = expired;
+        persisted.updated_at_ms = externally_updated_at;
+        store.write_session(&persisted).unwrap();
+
+        let inspection = store.inspection(&session.id).unwrap();
+        assert_eq!(inspection.state, BackendLifecycleState::Stale);
+        assert!(!inspection.live);
+        assert_eq!(inspection.last_activity_at_ms, expired);
+        assert_eq!(
+            inspection.stale_reason.as_deref(),
+            Some("active task heartbeat expired")
+        );
     }
 
     #[tokio::test]
