@@ -78,6 +78,18 @@ pub struct BackendEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendWorkspace {
+    pub active_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_project_root: Option<String>,
+    pub managed_worktree: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_git_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSession {
     pub id: String,
     pub worker: String,
@@ -94,6 +106,8 @@ pub struct BackendSession {
     pub last_wait_started_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_wait_returned_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<BackendWorkspace>,
     pub commands: Vec<BackendCommand>,
     pub events: Vec<BackendEvent>,
 }
@@ -152,6 +166,14 @@ impl ChatGptBackendStore {
     }
 
     pub fn attach(&self, worker: &str) -> Result<BackendSession, String> {
+        self.attach_with_workspace(worker, None)
+    }
+
+    pub fn attach_with_workspace(
+        &self,
+        worker: &str,
+        workspace: Option<BackendWorkspace>,
+    ) -> Result<BackendSession, String> {
         validate_worker(worker)?;
         self.with_lock(|| {
             let mut sessions = self.read_all()?;
@@ -161,9 +183,24 @@ impl ChatGptBackendStore {
                 .rev()
                 .find(|session| session.worker == worker && session.closed_at_ms.is_none())
             {
+                if session.workspace != workspace {
+                    return Err(format!(
+                        "ChatGPT backend worker already has live session {} bound to a different workspace",
+                        session.id
+                    ));
+                }
                 return Ok(session);
             }
             let now = now_ms()?;
+            let ready_content = workspace
+                .as_ref()
+                .map(|workspace| {
+                    format!(
+                        "ChatGPT coding backend attached and ready in {}",
+                        workspace.active_root
+                    )
+                })
+                .unwrap_or_else(|| "ChatGPT coding backend attached".into());
             let mut session = BackendSession {
                 id: new_id()?,
                 worker: worker.to_string(),
@@ -176,12 +213,13 @@ impl ChatGptBackendStore {
                 waiting: false,
                 last_wait_started_at_ms: None,
                 last_wait_returned_at_ms: None,
+                workspace,
                 commands: Vec::new(),
                 events: vec![BackendEvent {
                     seq: 1,
                     kind: BackendEventKind::Ready,
                     command_seq: None,
-                    content: "ChatGPT coding backend attached".into(),
+                    content: ready_content,
                     created_at_ms: now,
                 }],
             };
@@ -895,6 +933,37 @@ mod tests {
         let second = store.attach("worker-a").unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(first.events[0].kind, BackendEventKind::Ready);
+    }
+
+    #[test]
+    fn attach_persists_workspace_and_rejects_live_workspace_mismatch() {
+        let (_root, store) = store();
+        let workspace = BackendWorkspace {
+            active_root: "/tmp/worktree-a".into(),
+            source_project_root: Some("/tmp/project-a".into()),
+            managed_worktree: true,
+            worktree_git_root: Some("/tmp/worktree-a".into()),
+            repository_url: Some("https://example.com/repo.git".into()),
+        };
+        let first = store
+            .attach_with_workspace("worker-a", Some(workspace.clone()))
+            .unwrap();
+        assert_eq!(first.workspace.as_ref(), Some(&workspace));
+        assert!(first.events[0].content.contains("/tmp/worktree-a"));
+
+        let second = store
+            .attach_with_workspace("worker-a", Some(workspace.clone()))
+            .unwrap();
+        assert_eq!(first.id, second.id);
+
+        let different = BackendWorkspace {
+            active_root: "/tmp/worktree-b".into(),
+            ..workspace
+        };
+        let error = store
+            .attach_with_workspace("worker-a", Some(different))
+            .unwrap_err();
+        assert!(error.contains("different workspace"));
     }
 
     #[tokio::test]
