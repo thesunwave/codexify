@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.6] - 2026-09-27
+
+### Changed
+
+- `chat_read` and `chat_await` now advertise `readOnlyHint: false` because they
+  acknowledge user messages and advance the conversation's read cursor. Their
+  execution behavior and other annotations are unchanged. The experimental
+  forced-read-only annotation override still takes precedence when enabled.
+
 ## [1.6.5] - 2026-09-26
 
 ### Changed
@@ -573,7 +582,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v1.6.3...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v1.6.6...HEAD
+[1.6.6]: https://github.com/devnoname120/codexify/compare/v1.6.5...v1.6.6
+[1.6.5]: https://github.com/devnoname120/codexify/compare/v1.6.4...v1.6.5
+[1.6.4]: https://github.com/devnoname120/codexify/compare/v1.6.3...v1.6.4
 [1.6.3]: https://github.com/devnoname120/codexify/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/devnoname120/codexify/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/devnoname120/codexify/compare/v1.6.0...v1.6.1
