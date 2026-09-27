@@ -145,6 +145,7 @@ pub enum BackendLifecycleState {
     Attaching,
     Ready,
     Waiting,
+    Queued,
     Working,
     Cancelling,
     Draining,
@@ -159,6 +160,7 @@ impl BackendLifecycleState {
             Self::Attaching => "attaching",
             Self::Ready => "ready",
             Self::Waiting => "waiting",
+            Self::Queued => "queued",
             Self::Working => "working",
             Self::Cancelling => "cancelling",
             Self::Draining => "draining",
@@ -174,6 +176,7 @@ pub struct BackendSessionInspection {
     pub session_id: String,
     pub state: BackendLifecycleState,
     pub live: bool,
+    pub accepting_tasks: bool,
     pub last_activity_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_reason: Option<String>,
@@ -297,6 +300,10 @@ impl BackendSession {
             BackendLifecycleState::Draining
         } else if self.active_task_seq.is_some() {
             BackendLifecycleState::Working
+        } else if self.commands.iter().any(|command| {
+            command.kind == BackendCommandKind::Task && command.acknowledged_at_ms.is_none()
+        }) {
+            BackendLifecycleState::Queued
         } else if self.waiting {
             BackendLifecycleState::Waiting
         } else {
@@ -692,6 +699,54 @@ impl ChatGptBackendStore {
         })
     }
 
+    pub fn enqueue_task_on_available_session(
+        &self,
+        workspace: Option<&str>,
+        content: String,
+    ) -> Result<Option<(String, BackendCommand)>, String> {
+        validate_text("command", &content, MAX_COMMAND_BYTES)?;
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut sessions = self.read_all()?;
+            let mut candidate = None::<(usize, u64, u64)>;
+            for (index, session) in sessions.iter_mut().enumerate() {
+                if mark_session_stale_if_expired(session, now) {
+                    self.write_session(session)?;
+                }
+                if !session_accepts_task(session, now)
+                    || workspace.is_some_and(|expected| {
+                        session
+                            .workspace
+                            .as_ref()
+                            .is_none_or(|actual| actual.active_root != expected)
+                    })
+                {
+                    continue;
+                }
+                let key = (index, session.last_activity_at_ms(), session.created_at_ms);
+                if candidate
+                    .as_ref()
+                    .is_none_or(|(_, activity, created)| key.1 > *activity || (key.1 == *activity && key.2 > *created))
+                {
+                    candidate = Some(key);
+                }
+            }
+            let Some((index, _, _)) = candidate else {
+                return Ok(None);
+            };
+            let session = &mut sessions[index];
+            let command = enqueue_command_in_session(
+                session,
+                BackendCommandKind::Task,
+                content,
+                now,
+            )?;
+            let session_id = session.id.clone();
+            self.write_session(session)?;
+            Ok(Some((session_id, command)))
+        })
+    }
+
     pub fn enqueue_command(
         &self,
         session_id: &str,
@@ -711,79 +766,11 @@ impl ChatGptBackendStore {
         }
         self.with_lock(|| {
             let mut session = self.read_session(session_id)?;
-            if session.closed_at_ms.is_some() {
-                return Err(format!("ChatGPT backend session {session_id} is closed"));
-            }
             let now = now_ms()?;
             if mark_session_stale_if_expired(&mut session, now) {
                 self.write_session(&session)?;
             }
-            if session.stale_at_ms.is_some() {
-                return Err(format!(
-                    "ChatGPT backend session {session_id} is stale; attach a fresh backend session"
-                ));
-            }
-            let pending = session
-                .commands
-                .iter()
-                .filter(|command| command.acknowledged_at_ms.is_none())
-                .count();
-            if pending >= MAX_PENDING_COMMANDS {
-                return Err(format!(
-                    "ChatGPT backend session {session_id} already has {MAX_PENDING_COMMANDS} pending commands"
-                ));
-            }
-            if kind == BackendCommandKind::Task && session.draining_at_ms.is_some() {
-                return Err(format!(
-                    "ChatGPT backend session {session_id} is draining and does not accept new tasks"
-                ));
-            }
-            if kind == BackendCommandKind::Task
-                && (session.active_task_seq.is_some()
-                    || session.commands.iter().any(|command| {
-                        command.kind == BackendCommandKind::Task
-                            && command.acknowledged_at_ms.is_none()
-                    }))
-            {
-                return Err("a ChatGPT backend task is already active or queued".into());
-            }
-            if matches!(kind, BackendCommandKind::Steer | BackendCommandKind::Cancel)
-                && session.active_task_seq.is_none()
-                && !session.commands.iter().any(|command| {
-                    command.kind == BackendCommandKind::Task
-                        && command.acknowledged_at_ms.is_none()
-                })
-            {
-                return Err("steer/cancel requires an active or queued task".into());
-            }
-            let target_task_seq = match kind {
-                BackendCommandKind::Steer | BackendCommandKind::Cancel => session
-                    .active_task_seq
-                    .or_else(|| {
-                        session
-                            .commands
-                            .iter()
-                            .find(|command| {
-                                command.kind == BackendCommandKind::Task
-                                    && command.acknowledged_at_ms.is_none()
-                            })
-                            .map(|command| command.seq)
-                    }),
-                BackendCommandKind::Task | BackendCommandKind::Finish => None,
-            };
-            let command = BackendCommand {
-                seq: session.next_command_seq,
-                id: new_id()?,
-                kind,
-                target_task_seq,
-                content,
-                created_at_ms: now,
-                delivered_at_ms: None,
-                acknowledged_at_ms: None,
-            };
-            session.next_command_seq = session.next_command_seq.saturating_add(1);
-            session.updated_at_ms = now;
-            session.commands.push(command.clone());
+            let command = enqueue_command_in_session(&mut session, kind, content, now)?;
             self.write_session(&session)?;
             Ok(command)
         })
@@ -1125,9 +1112,90 @@ impl ChatGptBackendStore {
     }
 }
 
+fn enqueue_command_in_session(
+    session: &mut BackendSession,
+    kind: BackendCommandKind,
+    content: String,
+    now: u64,
+) -> Result<BackendCommand, String> {
+    let session_id = &session.id;
+    if session.closed_at_ms.is_some() {
+        return Err(format!("ChatGPT backend session {session_id} is closed"));
+    }
+    if session.failed_at_ms.is_some() {
+        return Err(format!("ChatGPT backend session {session_id} is failed"));
+    }
+    if session.stale_at_ms.is_some() {
+        return Err(format!(
+            "ChatGPT backend session {session_id} is stale; attach a fresh backend session"
+        ));
+    }
+    let pending = session
+        .commands
+        .iter()
+        .filter(|command| command.acknowledged_at_ms.is_none())
+        .count();
+    if pending >= MAX_PENDING_COMMANDS {
+        return Err(format!(
+            "ChatGPT backend session {session_id} already has {MAX_PENDING_COMMANDS} pending commands"
+        ));
+    }
+    if kind == BackendCommandKind::Task && session.draining_at_ms.is_some() {
+        return Err(format!(
+            "ChatGPT backend session {session_id} is draining and does not accept new tasks"
+        ));
+    }
+    if kind == BackendCommandKind::Task
+        && (session.active_task_seq.is_some()
+            || session.commands.iter().any(|command| {
+                command.kind == BackendCommandKind::Task && command.acknowledged_at_ms.is_none()
+            }))
+    {
+        return Err("a ChatGPT backend task is already active or queued".into());
+    }
+    if matches!(kind, BackendCommandKind::Steer | BackendCommandKind::Cancel)
+        && session.active_task_seq.is_none()
+        && !session.commands.iter().any(|command| {
+            command.kind == BackendCommandKind::Task && command.acknowledged_at_ms.is_none()
+        })
+    {
+        return Err("steer/cancel requires an active or queued task".into());
+    }
+    let target_task_seq = match kind {
+        BackendCommandKind::Steer | BackendCommandKind::Cancel => session
+            .active_task_seq
+            .or_else(|| {
+                session
+                    .commands
+                    .iter()
+                    .find(|command| {
+                        command.kind == BackendCommandKind::Task
+                            && command.acknowledged_at_ms.is_none()
+                    })
+                    .map(|command| command.seq)
+            }),
+        BackendCommandKind::Task | BackendCommandKind::Finish => None,
+    };
+    let command = BackendCommand {
+        seq: session.next_command_seq,
+        id: new_id()?,
+        kind,
+        target_task_seq,
+        content,
+        created_at_ms: now,
+        delivered_at_ms: None,
+        acknowledged_at_ms: None,
+    };
+    session.next_command_seq = session.next_command_seq.saturating_add(1);
+    session.updated_at_ms = now;
+    session.commands.push(command.clone());
+    Ok(command)
+}
+
 fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspection {
     let stale_reason = session.stale_reason_at(now);
     let state = session.lifecycle_state_at(now);
+    let accepting_tasks = session_accepts_task(&session, now);
     let tasks = session
         .commands
         .iter()
@@ -1218,6 +1286,7 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
                 | BackendLifecycleState::Stale
         ),
         state,
+        accepting_tasks,
         last_activity_at_ms: session.last_activity_at_ms(),
         stale_reason,
         draining: session.draining_at_ms.is_some(),
@@ -1244,6 +1313,15 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
         tasks,
         timeline,
     }
+}
+
+fn session_accepts_task(session: &BackendSession, now: u64) -> bool {
+    matches!(
+        session.lifecycle_state_at(now),
+        BackendLifecycleState::Ready | BackendLifecycleState::Waiting
+    ) && !session.commands.iter().any(|command| {
+        command.kind == BackendCommandKind::Finish && command.acknowledged_at_ms.is_none()
+    })
 }
 
 fn mark_session_stale_if_expired(session: &mut BackendSession, now: u64) -> bool {

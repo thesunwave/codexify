@@ -41,7 +41,10 @@ impl BackendAdapterError {
             || message.contains("requires an active or queued task")
         {
             BackendAdapterErrorCode::Busy
-        } else if message.contains("stale") || message.contains("closed") {
+        } else if message.contains("stale")
+            || message.contains("closed")
+            || message.contains("failed")
+        {
             BackendAdapterErrorCode::Unavailable
         } else if message.contains("different workspace") {
             BackendAdapterErrorCode::Conflict
@@ -71,9 +74,18 @@ pub type BackendAdapterResult<T> = Result<T, BackendAdapterError>;
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackendControllerRequest {
     Sessions,
+    Pool {
+        #[serde(default)]
+        workspace: Option<String>,
+    },
     Acquire {
         #[serde(default)]
         workspace: Option<String>,
+    },
+    Dispatch {
+        #[serde(default)]
+        workspace: Option<String>,
+        prompt: String,
     },
     Status {
         session_id: String,
@@ -122,6 +134,7 @@ pub enum BackendControllerRequest {
 #[serde(untagged)]
 pub enum BackendControllerResponse {
     Sessions(Vec<ChatGptBackendSessionView>),
+    Pool(ChatGptBackendPoolView),
     Session(ChatGptBackendSessionView),
     Status(ChatGptBackendStatusView),
     Run(ChatGptBackendRunView),
@@ -151,6 +164,7 @@ pub struct ChatGptBackendSessionView {
     pub session_id: String,
     pub state: BackendLifecycleState,
     pub live: bool,
+    pub accepting_tasks: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +175,17 @@ pub struct ChatGptBackendSessionView {
     pub completed_tasks: u64,
     pub failed_tasks: u64,
     pub last_activity_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatGptBackendPoolView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    pub total_sessions: usize,
+    pub available_capacity: usize,
+    pub busy_sessions: usize,
+    pub draining_sessions: usize,
+    pub unavailable_sessions: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -222,8 +247,14 @@ impl ChatGptBackendAdapter {
             BackendControllerRequest::Sessions => {
                 Ok(BackendControllerResponse::Sessions(self.sessions()?))
             }
+            BackendControllerRequest::Pool { workspace } => Ok(
+                BackendControllerResponse::Pool(self.pool(workspace.as_deref())?),
+            ),
             BackendControllerRequest::Acquire { workspace } => Ok(
                 BackendControllerResponse::Session(self.acquire(workspace.as_deref())?),
+            ),
+            BackendControllerRequest::Dispatch { workspace, prompt } => Ok(
+                BackendControllerResponse::Run(self.dispatch_task(workspace.as_deref(), prompt)?),
             ),
             BackendControllerRequest::Status { session_id } => {
                 Ok(BackendControllerResponse::Status(self.status(&session_id)?))
@@ -297,6 +328,41 @@ impl ChatGptBackendAdapter {
         self.session_view(inspection)
     }
 
+    pub fn pool(&self, workspace: Option<&str>) -> BackendAdapterResult<ChatGptBackendPoolView> {
+        let inspections = self
+            .store
+            .list_inspections()
+            .map_err(BackendAdapterError::from_store)?;
+        let mut view = ChatGptBackendPoolView {
+            workspace: workspace.map(str::to_string),
+            total_sessions: 0,
+            available_capacity: 0,
+            busy_sessions: 0,
+            draining_sessions: 0,
+            unavailable_sessions: 0,
+        };
+        for inspection in inspections.into_iter().filter(|inspection| {
+            workspace.is_none_or(|expected| {
+                inspection
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|actual| actual.active_root == expected)
+            })
+        }) {
+            view.total_sessions += 1;
+            if inspection.accepting_tasks {
+                view.available_capacity += 1;
+            } else if inspection.state == BackendLifecycleState::Draining {
+                view.draining_sessions += 1;
+            } else if inspection.live {
+                view.busy_sessions += 1;
+            } else {
+                view.unavailable_sessions += 1;
+            }
+        }
+        Ok(view)
+    }
+
     pub fn status(&self, session_id: &str) -> BackendAdapterResult<ChatGptBackendStatusView> {
         let inspection = self
             .store
@@ -324,11 +390,7 @@ impl ChatGptBackendAdapter {
             .map_err(BackendAdapterError::from_store)?
             .into_iter()
             .filter(|inspection| {
-                inspection.live
-                    && matches!(
-                        inspection.state,
-                        BackendLifecycleState::Ready | BackendLifecycleState::Waiting
-                    )
+                inspection.accepting_tasks
                     && workspace.is_none_or(|expected| {
                         inspection
                             .workspace
@@ -352,6 +414,38 @@ impl ChatGptBackendAdapter {
         self.session_view(inspection)
     }
 
+    pub fn dispatch_task(
+        &self,
+        workspace: Option<&str>,
+        prompt: String,
+    ) -> BackendAdapterResult<ChatGptBackendRunView> {
+        let Some((session_id, command)) = self
+            .store
+            .enqueue_task_on_available_session(workspace, prompt)
+            .map_err(BackendAdapterError::from_store)?
+        else {
+            let capacity = self.pool(workspace)?;
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::Unavailable,
+                match workspace {
+                    Some(workspace) => format!(
+                        "no ChatGPT backend capacity is available for workspace {workspace} (busy={}, draining={}, unavailable={})",
+                        capacity.busy_sessions,
+                        capacity.draining_sessions,
+                        capacity.unavailable_sessions,
+                    ),
+                    None => format!(
+                        "no ChatGPT backend capacity is available (busy={}, draining={}, unavailable={})",
+                        capacity.busy_sessions,
+                        capacity.draining_sessions,
+                        capacity.unavailable_sessions,
+                    ),
+                },
+            ));
+        };
+        self.run(&session_id, &command.id)
+    }
+
     pub fn submit_task(
         &self,
         session_id: &str,
@@ -367,10 +461,7 @@ impl ChatGptBackendAdapter {
                 ),
             ));
         }
-        if !matches!(
-            session.state,
-            BackendLifecycleState::Ready | BackendLifecycleState::Waiting
-        ) {
+        if !session.accepting_tasks {
             return Err(BackendAdapterError::new(
                 BackendAdapterErrorCode::Busy,
                 format!(
@@ -575,6 +666,7 @@ impl ChatGptBackendAdapter {
             session_id: inspection.session_id,
             state: inspection.state,
             live: inspection.live,
+            accepting_tasks: inspection.accepting_tasks,
             drain_reason: inspection.drain_reason,
             workspace: inspection.workspace,
             active_run_id,
@@ -820,11 +912,93 @@ mod tests {
             BackendAdapterErrorCode::Unavailable
         );
         let run = adapter.submit_task(&session.id, "work".into()).unwrap();
+        let queued_session = adapter.session(&session.id).unwrap();
+        assert_eq!(queued_session.state, BackendLifecycleState::Queued);
+        assert!(!queued_session.accepting_tasks);
+        assert_eq!(
+            adapter.acquire(Some("/workspace/a")).unwrap_err().code,
+            BackendAdapterErrorCode::Unavailable
+        );
         assert_eq!(
             adapter.finish(&session.id).unwrap_err().code,
             BackendAdapterErrorCode::Busy
         );
         assert_eq!(run.state, BackendRunState::Queued);
+    }
+
+    #[test]
+    fn pool_reports_explicit_capacity_and_dispatch_routes_across_workspace_workers() {
+        let (_root, adapter, store) = adapter();
+        let workspace = BackendWorkspace {
+            active_root: "/workspace/a".into(),
+            source_project_root: Some("/workspace/a".into()),
+            managed_worktree: false,
+            worktree_git_root: None,
+            repository_url: None,
+        };
+        store
+            .attach_with_workspace("worker-a", Some(workspace.clone()))
+            .unwrap();
+        store
+            .attach_with_workspace("worker-b", Some(workspace))
+            .unwrap();
+
+        let initial = adapter.pool(Some("/workspace/a")).unwrap();
+        assert_eq!(initial.total_sessions, 2);
+        assert_eq!(initial.available_capacity, 2);
+        assert_eq!(initial.busy_sessions, 0);
+        assert_eq!(initial.draining_sessions, 0);
+        assert_eq!(initial.unavailable_sessions, 0);
+
+        let first = adapter
+            .dispatch_task(Some("/workspace/a"), "first".into())
+            .unwrap();
+        let after_first = adapter.pool(Some("/workspace/a")).unwrap();
+        assert_eq!(after_first.available_capacity, 1);
+        assert_eq!(after_first.busy_sessions, 1);
+
+        let second = adapter
+            .dispatch_task(Some("/workspace/a"), "second".into())
+            .unwrap();
+        assert_ne!(first.session_id, second.session_id);
+        let saturated = adapter.pool(Some("/workspace/a")).unwrap();
+        assert_eq!(saturated.available_capacity, 0);
+        assert_eq!(saturated.busy_sessions, 2);
+
+        let error = adapter
+            .dispatch_task(Some("/workspace/a"), "backpressure".into())
+            .unwrap_err();
+        assert_eq!(error.code, BackendAdapterErrorCode::Unavailable);
+        assert!(error.message.contains("busy=2"));
+    }
+
+    #[test]
+    fn concurrent_dispatch_has_one_winner_for_one_worker() {
+        let (_root, adapter, store) = adapter();
+        store.attach("worker-a").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for prompt in ["first", "second"] {
+            let adapter = adapter.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                adapter.dispatch_task(None, prompt.into())
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(error) if error.code == BackendAdapterErrorCode::Unavailable))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -852,6 +1026,10 @@ mod tests {
         assert_eq!(drained.state, BackendLifecycleState::Draining);
         assert!(drained.live);
         assert_eq!(drained.drain_reason.as_deref(), Some("planned rotation"));
+        let pool = adapter.pool(Some("/workspace/a")).unwrap();
+        assert_eq!(pool.available_capacity, 1);
+        assert_eq!(pool.draining_sessions, 1);
+        assert_eq!(pool.busy_sessions, 0);
 
         assert_eq!(
             adapter.acquire(Some("/workspace/a")).unwrap().session_id,
@@ -943,6 +1121,16 @@ mod tests {
         let (_root, adapter, store) = adapter();
         let session = store.attach("worker-a").unwrap();
 
+        let pool_request: BackendControllerRequest = serde_json::from_value(serde_json::json!({
+            "op": "pool"
+        }))
+        .unwrap();
+        let response = adapter.handle_controller_request(pool_request).await.unwrap();
+        let BackendControllerResponse::Pool(pool) = response else {
+            panic!("expected pool controller response");
+        };
+        assert_eq!(pool.available_capacity, 1);
+
         let drain_request: BackendControllerRequest = serde_json::from_value(serde_json::json!({
             "op": "drain",
             "session_id": session.id,
@@ -961,8 +1149,7 @@ mod tests {
 
         let fresh = store.attach("worker-b").unwrap();
         let request: BackendControllerRequest = serde_json::from_value(serde_json::json!({
-            "op": "submit",
-            "session_id": fresh.id,
+            "op": "dispatch",
             "prompt": "controller task"
         }))
         .unwrap();
@@ -971,6 +1158,7 @@ mod tests {
             panic!("expected run controller response");
         };
         assert_eq!(run.state, BackendRunState::Queued);
+        assert_eq!(run.session_id, fresh.id);
 
         let encoded = serde_json::to_value(&run).unwrap();
         assert!(encoded.get("run_id").is_some());
