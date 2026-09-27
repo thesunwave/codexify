@@ -94,6 +94,11 @@ async fn run_chatgpt_backend(cli: Cli, command: ChatGptBackendCommand) -> anyhow
                 .cancel(&args.session_id, &args.run_id, args.reason)
                 .map_err(anyhow::Error::new)?,
         ),
+        ChatGptBackendCommand::Abandon(args) => write_json(
+            &adapter
+                .abandon(&args.session_id, Some(args.reason))
+                .map_err(anyhow::Error::new)?,
+        ),
         ChatGptBackendCommand::Finish(args) => write_json(
             &adapter
                 .finish(&args.session_id)
