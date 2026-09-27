@@ -1699,6 +1699,56 @@ mod tests {
         assert!(!json.contains("TOP_SECRET_RESULT"));
     }
 
+    #[tokio::test]
+    async fn session_inspection_survives_store_reconstruction() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("backend");
+        let store = ChatGptBackendStore::new_at(directory.clone());
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExchangeOutcome::Command(ref command) if command.seq == task.seq));
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                None,
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Result,
+                    command_seq: task.seq,
+                    content: "done".into(),
+                }),
+            )
+            .unwrap();
+        store.mark_waiting("worker-a", &session.id, true).unwrap();
+        drop(store);
+
+        let reopened = ChatGptBackendStore::new_at(directory);
+        let inspection = reopened.inspection(&session.id).unwrap();
+        assert_eq!(inspection.state, BackendLifecycleState::Waiting);
+        assert!(inspection.live);
+        assert_eq!(inspection.completed_tasks, 1);
+        assert_eq!(inspection.failed_tasks, 0);
+        assert_eq!(inspection.pending_commands, 0);
+        assert!(inspection.waiting);
+        assert!(inspection.timeline.iter().any(|entry| {
+            entry.kind == "event"
+                && entry.command_seq == Some(task.seq)
+                && entry.event_kind == Some(BackendEventKind::Result)
+        }));
+    }
+
     #[test]
     fn pending_command_queue_is_bounded() {
         let (_root, store) = store();
