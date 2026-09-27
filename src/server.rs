@@ -689,6 +689,36 @@ impl ServerHandler for CodexHandler {
             .filter(|value| !value.is_empty() && value.len() <= 64)
             .map(str::to_owned);
         let call_id = self.next_tool_call_id.fetch_add(1, Ordering::Relaxed);
+        let backend_active_call = if self.config.experimental.chatgpt_bridge
+            && model_call
+            && !matches!(
+                name.as_str(),
+                "chatgpt_backend_attach" | "chatgpt_backend_exchange"
+            )
+            && let Some(identity) = conversation.as_ref()
+        {
+            match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config)
+                .and_then(|store| store.active_task_for_worker(identity.stable_key()))
+            {
+                Ok(Some((_session_id, _task_seq))) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::warn!(%error, "could not inspect active ChatGPT backend task");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        // Preserve the historical server cancellation identity for every ordinary
+        // call. Only an active ChatGPT backend task gets an independently cancellable
+        // child token so Paseo can interrupt that one tool call without cancelling the
+        // whole MCP request/turn.
+        let tool_cancellation = if backend_active_call {
+            context.ct.child_token()
+        } else {
+            context.ct.clone()
+        };
         let tool_context = ToolRequestContext {
             conversation: conversation.clone(),
             connector_schema_version,
@@ -700,7 +730,7 @@ impl ServerHandler for CodexHandler {
             project_bindings: self.project_bindings.clone(),
             diff_checkpoints: self.diff_checkpoints.clone(),
             artifact_egress: self.artifact_egress.clone(),
-            cancellation: context.ct.clone(),
+            cancellation: tool_cancellation.clone(),
         };
 
         // Keep `tool` as an Option so that even an unknown-tool call flows through
@@ -784,6 +814,53 @@ impl ServerHandler for CodexHandler {
                 "tool arguments summarized"
             );
         }
+
+        let backend_cancel_watch = if backend_active_call
+            && !matches!(
+                name.as_str(),
+                "chatgpt_backend_attach" | "chatgpt_backend_exchange"
+            )
+            && let Some(identity) = conversation.as_ref()
+        {
+            match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config) {
+                Ok(store) => match store.active_task_for_worker(identity.stable_key()) {
+                    Ok(Some((_session_id, _task_seq))) => {
+                        let worker = identity.stable_key().to_string();
+                        let cancellation = tool_cancellation.clone();
+                        Some(tokio::spawn(async move {
+                            loop {
+                                if cancellation.is_cancelled() {
+                                    return;
+                                }
+                                match store.pending_cancel_for_worker(&worker) {
+                                    Ok(Some((_session_id, _command))) => {
+                                        cancellation.cancel();
+                                        return;
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        tracing::warn!(%error, "could not inspect ChatGPT backend cancellation queue");
+                                        return;
+                                    }
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }))
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not inspect active ChatGPT backend task");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "could not open ChatGPT backend cancellation store");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let started = Instant::now();
         let mut result = if let Some(error) =
@@ -953,6 +1030,9 @@ impl ServerHandler for CodexHandler {
                 }
             }
         };
+        if let Some(watch) = backend_cancel_watch {
+            watch.abort();
+        }
 
         if agent_call
             && !result.is_error

@@ -51,6 +51,8 @@ pub struct BackendCommand {
     pub seq: u64,
     pub id: String,
     pub kind: BackendCommandKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_task_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     pub created_at_ms: u64,
@@ -58,6 +60,11 @@ pub struct BackendCommand {
     pub delivered_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acknowledged_at_ms: Option<u64>,
+}
+
+fn control_targets_task(command: &BackendCommand, task_seq: u64) -> bool {
+    command.target_task_seq == Some(task_seq)
+        || (command.target_task_seq.is_none() && command.seq > task_seq)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +204,20 @@ impl ChatGptBackendStore {
         self.with_lock(|| self.read_session(session_id))
     }
 
+    pub fn active_task_for_worker(&self, worker: &str) -> Result<Option<(String, u64)>, String> {
+        validate_worker(worker)?;
+        self.with_lock(|| {
+            let mut sessions = self.read_all()?;
+            sessions.sort_by_key(|session| session.created_at_ms);
+            Ok(sessions.into_iter().rev().find_map(|session| {
+                (session.worker == worker && session.closed_at_ms.is_none())
+                    .then_some(session.active_task_seq)
+                    .flatten()
+                    .map(|task_seq| (session.id, task_seq))
+            }))
+        })
+    }
+
     pub fn pending_control_for_worker(
         &self,
         worker: &str,
@@ -213,25 +234,48 @@ impl ChatGptBackendStore {
                 return Ok(None);
             };
 
+            let active_seq = session
+                .active_task_seq
+                .expect("active backend session search guarantees an active task");
+
             // Reaching any ordinary Codexify tool boundary proves the model already
             // received and started processing the active task. Mark it acknowledged
             // here so a subsequent non-blocking exchange used only to ACK injected
             // control cannot replay the original task.
-            if let Some(active_seq) = session.active_task_seq
-                && let Some(task) = session
-                    .commands
-                    .iter_mut()
-                    .find(|command| command.seq == active_seq)
+            if let Some(task) = session
+                .commands
+                .iter_mut()
+                .find(|command| command.seq == active_seq)
                 && task.acknowledged_at_ms.is_none()
             {
                 task.acknowledged_at_ms = Some(now_ms()?);
                 session.updated_at_ms = now_ms()?;
             }
 
-            let Some(index) = session.commands.iter().position(|command| {
+            let targets_active = |command: &BackendCommand| {
+                control_targets_task(command, active_seq)
+            };
+            let is_pending_control = |command: &BackendCommand| {
                 matches!(command.kind, BackendCommandKind::Steer | BackendCommandKind::Cancel)
                     && command.acknowledged_at_ms.is_none()
-            }) else {
+                    && targets_active(command)
+            };
+
+            // Never skip a control the model may already have seen. Otherwise prefer
+            // cancellation over an as-yet-undelivered steer, because cancel is the
+            // stronger control signal and completing it will supersede later controls.
+            let index = session
+                .commands
+                .iter()
+                .position(|command| is_pending_control(command) && command.delivered_at_ms.is_some())
+                .or_else(|| {
+                    session.commands.iter().position(|command| {
+                        is_pending_control(command)
+                            && command.kind == BackendCommandKind::Cancel
+                    })
+                })
+                .or_else(|| session.commands.iter().position(is_pending_control));
+            let Some(index) = index else {
                 self.write_session(&session)?;
                 return Ok(None);
             };
@@ -242,6 +286,48 @@ impl ChatGptBackendStore {
                 session.updated_at_ms = now;
             }
             self.write_session(&session)?;
+            Ok(Some((session.id.clone(), session.commands[index].clone())))
+        })
+    }
+
+    /// Return a pending cancel for the worker's active task and mark it delivered.
+    ///
+    /// Unlike `pending_control_for_worker`, this is safe to poll while a Codexify
+    /// tool call is still running. It lets the daemon cancel that tool's child
+    /// cancellation token before the model reaches its next tool-result boundary.
+    /// The command remains unacknowledged and is therefore replayed to the model
+    /// after the interrupted tool returns.
+    pub fn pending_cancel_for_worker(
+        &self,
+        worker: &str,
+    ) -> Result<Option<(String, BackendCommand)>, String> {
+        validate_worker(worker)?;
+        self.with_lock(|| {
+            let mut sessions = self.read_all()?;
+            sessions.sort_by_key(|session| session.created_at_ms);
+            let Some(mut session) = sessions.into_iter().rev().find(|session| {
+                session.worker == worker
+                    && session.closed_at_ms.is_none()
+                    && session.active_task_seq.is_some()
+            }) else {
+                return Ok(None);
+            };
+            let active_seq = session
+                .active_task_seq
+                .expect("active backend session search guarantees an active task");
+            let Some(index) = session.commands.iter().position(|command| {
+                command.kind == BackendCommandKind::Cancel
+                    && command.acknowledged_at_ms.is_none()
+                    && control_targets_task(command, active_seq)
+            }) else {
+                return Ok(None);
+            };
+            if session.commands[index].delivered_at_ms.is_none() {
+                let now = now_ms()?;
+                session.commands[index].delivered_at_ms = Some(now);
+                session.updated_at_ms = now;
+                self.write_session(&session)?;
+            }
             Ok(Some((session.id.clone(), session.commands[index].clone())))
         })
     }
@@ -296,11 +382,27 @@ impl ChatGptBackendStore {
             {
                 return Err("steer/cancel requires an active or queued task".into());
             }
+            let target_task_seq = match kind {
+                BackendCommandKind::Steer | BackendCommandKind::Cancel => session
+                    .active_task_seq
+                    .or_else(|| {
+                        session
+                            .commands
+                            .iter()
+                            .find(|command| {
+                                command.kind == BackendCommandKind::Task
+                                    && command.acknowledged_at_ms.is_none()
+                            })
+                            .map(|command| command.seq)
+                    }),
+                BackendCommandKind::Task | BackendCommandKind::Finish => None,
+            };
             let now = now_ms()?;
             let command = BackendCommand {
                 seq: session.next_command_seq,
                 id: new_id()?,
                 kind,
+                target_task_seq,
                 content,
                 created_at_ms: now,
                 delivered_at_ms: None,
@@ -349,25 +451,53 @@ impl ChatGptBackendStore {
                     return Err("model outbound event must be result or error".into());
                 }
                 validate_text("event content", &outbound.content, MAX_EVENT_BYTES)?;
-                let task = session
+                let task_index = session
                     .commands
-                    .iter_mut()
-                    .find(|command| command.seq == outbound.command_seq)
+                    .iter()
+                    .position(|command| command.seq == outbound.command_seq)
                     .ok_or_else(|| format!("unknown task sequence {}", outbound.command_seq))?;
-                if task.kind != BackendCommandKind::Task {
+                if session.commands[task_index].kind != BackendCommandKind::Task {
                     return Err("outbound result/error must reference a task command".into());
                 }
-                if task.delivered_at_ms.is_none() {
+                if session.commands[task_index].delivered_at_ms.is_none() {
                     return Err(format!(
                         "task sequence {} has not been delivered",
                         outbound.command_seq
                     ));
                 }
+
+                // A control that was already injected into a model-visible tool result must
+                // be explicitly acknowledged. Otherwise accepting a terminal task result
+                // would silently discard a steer/cancel that the model had an opportunity
+                // to observe. Controls that never reached a tool result lose the race to
+                // task completion and are marked acknowledged-but-undelivered below.
+                if let Some(control) = session.commands.iter().find(|command| {
+                    matches!(command.kind, BackendCommandKind::Steer | BackendCommandKind::Cancel)
+                        && command.acknowledged_at_ms.is_none()
+                        && command.delivered_at_ms.is_some()
+                        && control_targets_task(command, outbound.command_seq)
+                }) {
+                    return Err(format!(
+                        "task {} has unacknowledged delivered control sequence {}",
+                        outbound.command_seq, control.seq
+                    ));
+                }
+
+                let now = now_ms()?;
+                for control in session.commands.iter_mut().filter(|command| {
+                    matches!(command.kind, BackendCommandKind::Steer | BackendCommandKind::Cancel)
+                        && command.acknowledged_at_ms.is_none()
+                        && command.delivered_at_ms.is_none()
+                        && control_targets_task(command, outbound.command_seq)
+                }) {
+                    control.acknowledged_at_ms = Some(now);
+                }
+
                 // Returning a terminal event is itself a definitive acknowledgement of the
                 // task. This leaves ack_command_seq available for an injected steer/cancel
                 // command in the same exchange call.
-                if task.acknowledged_at_ms.is_none() {
-                    task.acknowledged_at_ms = Some(now_ms()?);
+                if session.commands[task_index].acknowledged_at_ms.is_none() {
+                    session.commands[task_index].acknowledged_at_ms = Some(now);
                 }
 
                 if let Some(existing) = session.events.iter().find(|event| {
@@ -1030,6 +1160,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_preempts_undelivered_steer_and_supersedes_it_on_task_cancellation() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let steer = store
+            .enqueue_command(&session.id, BackendCommandKind::Steer, "later direction".into())
+            .unwrap();
+        let cancel = store
+            .enqueue_command(&session.id, BackendCommandKind::Cancel, "stop now".into())
+            .unwrap();
+        assert_eq!(steer.target_task_seq, Some(task.seq));
+        assert_eq!(cancel.target_task_seq, Some(task.seq));
+
+        let (_, control) = store
+            .pending_control_for_worker("worker-a")
+            .unwrap()
+            .expect("cancel should preempt undelivered steer");
+        assert_eq!(control.seq, cancel.seq);
+        assert_eq!(control.kind, BackendCommandKind::Cancel);
+
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                Some(cancel.seq),
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Error,
+                    command_seq: task.seq,
+                    content: "cancelled".into(),
+                }),
+            )
+            .unwrap();
+
+        let current = store.session(&session.id).unwrap();
+        let stored_steer = current
+            .commands
+            .iter()
+            .find(|command| command.seq == steer.seq)
+            .unwrap();
+        assert!(stored_steer.delivered_at_ms.is_none());
+        assert!(stored_steer.acknowledged_at_ms.is_some());
+        assert!(current.active_task_seq.is_none());
+        assert_eq!(current.events.last().unwrap().kind, BackendEventKind::Error);
+    }
+
+    #[tokio::test]
+    async fn terminal_result_rejects_a_delivered_unacknowledged_control() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let steer = store
+            .enqueue_command(&session.id, BackendCommandKind::Steer, "change direction".into())
+            .unwrap();
+        store
+            .pending_control_for_worker("worker-a")
+            .unwrap()
+            .expect("steer should be delivered");
+
+        let error = store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                None,
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Result,
+                    command_seq: task.seq,
+                    content: "ignored steer".into(),
+                }),
+            )
+            .unwrap_err();
+        assert!(error.contains(&format!(
+            "unacknowledged delivered control sequence {}",
+            steer.seq
+        )));
+        assert!(store.session(&session.id).unwrap().active_task_seq.is_some());
+    }
+
+    #[tokio::test]
+    async fn acknowledging_injected_steer_does_not_replay_the_active_task() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let steer = store
+            .enqueue_command(&session.id, BackendCommandKind::Steer, "change course".into())
+            .unwrap();
+        let (_, control) = store
+            .pending_control_for_worker("worker-a")
+            .unwrap()
+            .expect("steer should be injected");
+        assert_eq!(control.seq, steer.seq);
+
+        let current = store.session(&session.id).unwrap();
+        assert!(
+            current
+                .commands
+                .iter()
+                .find(|command| command.seq == task.seq)
+                .unwrap()
+                .acknowledged_at_ms
+                .is_some(),
+            "ordinary tool boundary should acknowledge the active task"
+        );
+
+        store
+            .prepare_exchange("worker-a", &session.id, Some(steer.seq), None)
+            .unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExchangeOutcome::Idle));
+        assert_eq!(store.session(&session.id).unwrap().active_task_seq, Some(task.seq));
+    }
+
+    #[tokio::test]
     async fn terminal_task_event_acks_task_while_control_uses_the_explicit_ack_slot() {
         let (_root, store) = store();
         let session = store.attach("worker-a").unwrap();
@@ -1090,5 +1379,63 @@ mod tests {
         assert_eq!(session.active_task_seq, None);
         assert_eq!(session.events.last().unwrap().kind, BackendEventKind::Error);
         assert_eq!(session.events.last().unwrap().content, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn pending_cancel_marks_delivery_and_replays_until_model_acknowledges_it() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "long work".into())
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let cancel = store
+            .enqueue_command(&session.id, BackendCommandKind::Cancel, "stop".into())
+            .unwrap();
+        assert_eq!(cancel.target_task_seq, Some(task.seq));
+
+        for _ in 0..2 {
+            let (control_session, delivered) = store
+                .pending_cancel_for_worker("worker-a")
+                .unwrap()
+                .expect("cancel should interrupt the active tool call");
+            assert_eq!(control_session, session.id);
+            assert_eq!(delivered.seq, cancel.seq);
+            assert_eq!(delivered.kind, BackendCommandKind::Cancel);
+            assert!(delivered.delivered_at_ms.is_some());
+            assert!(delivered.acknowledged_at_ms.is_none());
+        }
+
+        // The ordinary tool result boundary must replay the exact same cancel to the
+        // model; daemon-side interruption alone never consumes controller intent.
+        let (_, replayed) = store
+            .pending_control_for_worker("worker-a")
+            .unwrap()
+            .expect("cancel remains pending for model acknowledgement");
+        assert_eq!(replayed.seq, cancel.seq);
+
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                Some(cancel.seq),
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Error,
+                    command_seq: task.seq,
+                    content: "cancelled".into(),
+                }),
+            )
+            .unwrap();
+        assert!(store.pending_cancel_for_worker("worker-a").unwrap().is_none());
     }
 }
