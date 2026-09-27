@@ -349,44 +349,157 @@ mod unix {
             let listener = UnixListener::bind(&socket).unwrap();
             let config = Arc::new(crate::config::default_config(root.path().to_path_buf()));
             let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (read_half, mut write_half) = stream.into_split();
-                let mut reader = BufReader::new(read_half);
-                let mut line = String::new();
-                reader.read_line(&mut line).await.unwrap();
-                let (id, request) = parse_request(line.as_bytes()).unwrap();
-                let result = adapter
-                    .handle_controller_request(request)
-                    .await
-                    .unwrap();
-                write_response(
-                    &mut write_half,
-                    ControllerResponse {
-                        id,
-                        ok: true,
-                        result: Some(to_value(result).unwrap()),
-                        error: None,
-                    },
-                )
-                .await
-                .unwrap();
+                for _ in 0..6 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let (id, request) = parse_request(line.as_bytes()).unwrap();
+                    let response = match adapter.handle_controller_request(request).await {
+                        Ok(result) => ControllerResponse {
+                            id,
+                            ok: true,
+                            result: Some(to_value(result).unwrap()),
+                            error: None,
+                        },
+                        Err(error) => ControllerResponse {
+                            id,
+                            ok: false,
+                            result: None,
+                            error: Some(error),
+                        },
+                    };
+                    write_response(&mut write_half, response).await.unwrap();
+                }
                 drop(config);
             });
 
             let response = request(
                 &socket,
                 serde_json::json!({
-                    "op": "status",
+                    "op": "pool",
                     "id": "req-1",
-                    "session_id": session.id,
                 }),
             )
             .await
             .unwrap();
             assert_eq!(response["ok"], true);
             assert_eq!(response["id"], "req-1");
-            assert_eq!(response["result"]["session"]["state"], "ready");
-            assert!(response["result"].get("worker").is_none());
+            assert_eq!(response["result"]["available_capacity"], 1);
+
+            let dispatched = request(
+                &socket,
+                serde_json::json!({
+                    "op": "dispatch",
+                    "id": "req-2",
+                    "prompt": "controller task",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dispatched["ok"], true);
+            assert_eq!(dispatched["result"]["session_id"], session.id);
+            assert_eq!(dispatched["result"]["state"], "queued");
+
+            let saturated = request(
+                &socket,
+                serde_json::json!({
+                    "op": "dispatch",
+                    "id": "req-3",
+                    "prompt": "must backpressure",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saturated["ok"], false);
+            assert_eq!(saturated["error"]["code"], "unavailable");
+
+            let outcome = store
+                .exchange_wait(
+                    "worker-a",
+                    &session.id,
+                    false,
+                    0,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let command = match outcome {
+                crate::chatgpt_backend::ExchangeOutcome::Command(command) => command,
+                other => panic!("expected dispatched task command, got {other:?}"),
+            };
+            let activity_seq = store
+                .start_tool_activity(&session.id, command.seq, "exec_command")
+                .unwrap();
+
+            let running = request(
+                &socket,
+                serde_json::json!({
+                    "op": "status",
+                    "id": "req-4",
+                    "session_id": session.id,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(running["ok"], true);
+            assert!(running["result"]["timeline"].as_array().unwrap().iter().any(|entry| {
+                entry["kind"] == "tool_started"
+                    && entry["seq"] == activity_seq
+                    && entry["tool"] == "exec_command"
+                    && entry["tool_status"] == "running"
+            }));
+
+            store
+                .complete_tool_activity(
+                    &session.id,
+                    activity_seq,
+                    crate::chatgpt_backend::BackendToolActivityStatus::Succeeded,
+                )
+                .unwrap();
+            store
+                .prepare_exchange(
+                    "worker-a",
+                    &session.id,
+                    None,
+                    Some(crate::chatgpt_backend::ExchangeOutbound {
+                        kind: crate::chatgpt_backend::BackendEventKind::Result,
+                        command_seq: command.seq,
+                        content: "done".into(),
+                    }),
+                )
+                .unwrap();
+
+            let completed = request(
+                &socket,
+                serde_json::json!({
+                    "op": "status",
+                    "id": "req-5",
+                    "session_id": session.id,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(completed["ok"], true);
+            assert!(completed["result"]["timeline"].as_array().unwrap().iter().any(|entry| {
+                entry["kind"] == "tool_completed"
+                    && entry["seq"] == activity_seq
+                    && entry["tool_status"] == "succeeded"
+            }));
+            assert!(completed["result"].get("worker").is_none());
+
+            let available_again = request(
+                &socket,
+                serde_json::json!({
+                    "op": "pool",
+                    "id": "req-6",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(available_again["ok"], true);
+            assert_eq!(available_again["result"]["available_capacity"], 1);
             server.await.unwrap();
         }
 
