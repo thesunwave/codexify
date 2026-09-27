@@ -17,6 +17,7 @@ pub mod chatgpt_bridge;
 pub mod chatgpt_bridge_ui;
 pub mod chatgpt_backend;
 pub mod chatgpt_backend_adapter;
+pub mod chatgpt_backend_controller;
 pub mod codex_config;
 pub mod codex_mcp;
 mod codex_plugin_skills;

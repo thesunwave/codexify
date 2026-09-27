@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::chatgpt_backend::{
@@ -63,6 +63,66 @@ impl std::fmt::Display for BackendAdapterError {
 impl std::error::Error for BackendAdapterError {}
 
 pub type BackendAdapterResult<T> = Result<T, BackendAdapterError>;
+
+/// Stable process-neutral control-plane request used by Paseo and other local
+/// controllers. This deliberately exposes backend semantics rather than the
+/// underlying ChatGPT/MCP bridge protocol.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BackendControllerRequest {
+    Sessions,
+    Acquire {
+        #[serde(default)]
+        workspace: Option<String>,
+    },
+    Status {
+        session_id: String,
+    },
+    Submit {
+        session_id: String,
+        prompt: String,
+    },
+    Run {
+        session_id: String,
+        run_id: String,
+    },
+    Wait {
+        session_id: String,
+        run_id: String,
+        #[serde(default = "default_controller_wait_ms")]
+        timeout_ms: u64,
+    },
+    Steer {
+        session_id: String,
+        run_id: String,
+        instruction: String,
+    },
+    Cancel {
+        session_id: String,
+        run_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    Finish {
+        session_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum BackendControllerResponse {
+    Sessions(Vec<ChatGptBackendSessionView>),
+    Session(ChatGptBackendSessionView),
+    Status(ChatGptBackendStatusView),
+    Run(ChatGptBackendRunView),
+    Receipt(BackendControlReceipt),
+}
+
+const MAX_CONTROLLER_WAIT_MS: u64 = 300_000;
+
+fn default_controller_wait_ms() -> u64 {
+    MAX_CONTROLLER_WAIT_MS
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +199,66 @@ impl ChatGptBackendAdapter {
     pub fn new_at(directory: std::path::PathBuf) -> Self {
         Self {
             store: ChatGptBackendStore::new_at(directory),
+        }
+    }
+
+    pub async fn handle_controller_request(
+        &self,
+        request: BackendControllerRequest,
+    ) -> BackendAdapterResult<BackendControllerResponse> {
+        match request {
+            BackendControllerRequest::Sessions => {
+                Ok(BackendControllerResponse::Sessions(self.sessions()?))
+            }
+            BackendControllerRequest::Acquire { workspace } => Ok(
+                BackendControllerResponse::Session(self.acquire(workspace.as_deref())?),
+            ),
+            BackendControllerRequest::Status { session_id } => {
+                Ok(BackendControllerResponse::Status(self.status(&session_id)?))
+            }
+            BackendControllerRequest::Submit { session_id, prompt } => Ok(
+                BackendControllerResponse::Run(self.submit_task(&session_id, prompt)?),
+            ),
+            BackendControllerRequest::Run { session_id, run_id } => Ok(
+                BackendControllerResponse::Run(self.run(&session_id, &run_id)?),
+            ),
+            BackendControllerRequest::Wait {
+                session_id,
+                run_id,
+                timeout_ms,
+            } => {
+                if timeout_ms > MAX_CONTROLLER_WAIT_MS {
+                    return Err(BackendAdapterError::new(
+                        BackendAdapterErrorCode::InvalidArgument,
+                        format!("timeout_ms must be at most {MAX_CONTROLLER_WAIT_MS}"),
+                    ));
+                }
+                Ok(BackendControllerResponse::Run(
+                    self.wait_run(&session_id, &run_id, Duration::from_millis(timeout_ms))
+                        .await?,
+                ))
+            }
+            BackendControllerRequest::Steer {
+                session_id,
+                run_id,
+                instruction,
+            } => Ok(BackendControllerResponse::Receipt(self.steer(
+                &session_id,
+                &run_id,
+                instruction,
+            )?)),
+            BackendControllerRequest::Cancel {
+                session_id,
+                run_id,
+                reason,
+            } => Ok(BackendControllerResponse::Receipt(self.cancel(
+                &session_id,
+                &run_id,
+                reason,
+            )?)),
+            BackendControllerRequest::Finish { session_id } => Ok(
+                BackendControllerResponse::Receipt(self.finish(&session_id)?),
+            ),
         }
     }
 
@@ -643,5 +763,36 @@ mod tests {
             BackendAdapterErrorCode::Busy
         );
         assert_eq!(run.state, BackendRunState::Queued);
+    }
+
+    #[tokio::test]
+    async fn controller_request_round_trip_stays_on_adapter_contract() {
+        let (_root, adapter, store) = adapter();
+        let session = store.attach("worker-a").unwrap();
+
+        let request: BackendControllerRequest = serde_json::from_value(serde_json::json!({
+            "op": "submit",
+            "session_id": session.id,
+            "prompt": "controller task"
+        }))
+        .unwrap();
+        let response = adapter.handle_controller_request(request).await.unwrap();
+        let BackendControllerResponse::Run(run) = response else {
+            panic!("expected run controller response");
+        };
+        assert_eq!(run.state, BackendRunState::Queued);
+
+        let encoded = serde_json::to_value(&run).unwrap();
+        assert!(encoded.get("run_id").is_some());
+        assert!(encoded.get("command_seq").is_none());
+        assert!(encoded.get("worker").is_none());
+
+        let invalid = serde_json::from_value::<BackendControllerRequest>(serde_json::json!({
+            "op": "submit",
+            "session_id": session.id,
+            "prompt": "x",
+            "bridge_internal": true
+        }));
+        assert!(invalid.is_err());
     }
 }

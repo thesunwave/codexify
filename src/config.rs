@@ -728,6 +728,8 @@ impl PartialMcpServerSpec {
 struct PartialExperimental {
     agent_tickets: Option<bool>,
     chatgpt_bridge: Option<bool>,
+    chatgpt_backend_controller_socket: Option<String>,
+    chatgpt_backend_controller_allowed_uid: Option<u32>,
     force_read_only_tool_annotations: Option<bool>,
     claude_skills: Option<bool>,
 }
@@ -1795,6 +1797,24 @@ fn load_config_with_announcements(
     }
 
     let experimental = file.experimental.unwrap_or_default();
+    let chatgpt_backend_controller_socket = experimental
+        .chatgpt_backend_controller_socket
+        .map(std::path::PathBuf::from);
+    if let Some(path) = &chatgpt_backend_controller_socket
+        && !path.is_absolute()
+    {
+        return Err(
+            "experimental.chatgptBackendControllerSocket must be an absolute path".into(),
+        );
+    }
+    if experimental.chatgpt_backend_controller_allowed_uid.is_some()
+        && chatgpt_backend_controller_socket.is_none()
+    {
+        return Err(
+            "experimental.chatgptBackendControllerAllowedUid requires experimental.chatgptBackendControllerSocket"
+                .into(),
+        );
+    }
     let config = AppConfig {
         work_dir,
         debug: file.debug.unwrap_or(false),
@@ -1802,6 +1822,9 @@ fn load_config_with_announcements(
         experimental: ExperimentalConfig {
             agent_tickets: experimental.agent_tickets.unwrap_or(false),
             chatgpt_bridge: experimental.chatgpt_bridge.unwrap_or(false),
+            chatgpt_backend_controller_socket,
+            chatgpt_backend_controller_allowed_uid: experimental
+                .chatgpt_backend_controller_allowed_uid,
             force_read_only_tool_annotations: experimental
                 .force_read_only_tool_annotations
                 .or(file.force_read_only_tool_annotations)
@@ -2098,6 +2121,18 @@ mod tests {
                 .chatgpt_bridge
         );
         assert!(
+            default_config(root.path().to_path_buf())
+                .experimental
+                .chatgpt_backend_controller_socket
+                .is_none()
+        );
+        assert!(
+            default_config(root.path().to_path_buf())
+                .experimental
+                .chatgpt_backend_controller_allowed_uid
+                .is_none()
+        );
+        assert!(
             !default_config(root.path().to_path_buf())
                 .experimental
                 .claude_skills
@@ -2137,6 +2172,7 @@ mod tests {
     fn experimental_config_loads_flags_from_nested_section() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
+        let controller_socket = root.path().join("chatgpt-backend.sock");
         std::fs::write(
             &path,
             serde_json::json!({
@@ -2146,6 +2182,8 @@ mod tests {
                 "experimental": {
                     "agentTickets": true,
                     "chatgptBridge": true,
+                    "chatgptBackendControllerSocket": controller_socket,
+                    "chatgptBackendControllerAllowedUid": 501,
                     "forceReadOnlyToolAnnotations": true,
                     "claudeSkills": true
                 }
@@ -2157,12 +2195,51 @@ mod tests {
         let config = load_config(args).unwrap();
         assert!(config.experimental.agent_tickets);
         assert!(config.experimental.chatgpt_bridge);
+        assert_eq!(
+            config.experimental.chatgpt_backend_controller_socket.as_deref(),
+            Some(controller_socket.as_path())
+        );
+        assert_eq!(
+            config.experimental.chatgpt_backend_controller_allowed_uid,
+            Some(501)
+        );
         assert!(config.experimental.force_read_only_tool_annotations);
         assert!(config.experimental.claude_skills);
         assert!(
             serde_json::from_str::<FileConfig>(r#"{"experimental":{"agentTickets":"true"}}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn chatgpt_backend_controller_config_requires_safe_shape() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+
+        for experimental in [
+            serde_json::json!({
+                "chatgptBridge": true,
+                "chatgptBackendControllerSocket": "relative.sock"
+            }),
+            serde_json::json!({
+                "chatgptBridge": true,
+                "chatgptBackendControllerAllowedUid": 501
+            }),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "workDir": root.path(),
+                    "codexMcp": {"enabled": false},
+                    "experimental": experimental
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let args = Cli::parse_from(["codexify", "--config", path.to_str().unwrap()]);
+            assert!(load_config(args).is_err());
+        }
     }
 
     #[test]
@@ -2393,6 +2470,8 @@ mod tests {
                 "experimental",
                 &[
                     "agentTickets",
+                    "chatgptBackendControllerAllowedUid",
+                    "chatgptBackendControllerSocket",
                     "chatgptBridge",
                     "forceReadOnlyToolAnnotations",
                     "claudeSkills",

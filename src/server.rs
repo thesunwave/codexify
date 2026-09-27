@@ -1400,6 +1400,7 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         }
     }
     let config = Arc::new(config);
+    let _chatgpt_backend_controller = crate::chatgpt_backend_controller::spawn(config.clone())?;
 
     // Connect to any configured upstream MCP servers and merge their tools in.
     // The returned services must stay alive for the whole server lifetime, so

@@ -6,6 +6,8 @@
   "experimental": {
     "agentTickets": false,
     "chatgptBridge": false,
+    "chatgptBackendControllerSocket": null,
+    "chatgptBackendControllerAllowedUid": null,
     "forceReadOnlyToolAnnotations": false,
     "claudeSkills": false
   },
