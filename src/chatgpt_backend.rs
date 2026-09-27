@@ -114,6 +114,10 @@ pub struct BackendSession {
     pub stale_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draining_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_reason: Option<String>,
     pub waiting: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_wait_started_at_ms: Option<u64>,
@@ -143,6 +147,7 @@ pub enum BackendLifecycleState {
     Waiting,
     Working,
     Cancelling,
+    Draining,
     Finished,
     Failed,
     Stale,
@@ -156,6 +161,7 @@ impl BackendLifecycleState {
             Self::Waiting => "waiting",
             Self::Working => "working",
             Self::Cancelling => "cancelling",
+            Self::Draining => "draining",
             Self::Finished => "finished",
             Self::Failed => "failed",
             Self::Stale => "stale",
@@ -171,6 +177,9 @@ pub struct BackendSessionInspection {
     pub last_activity_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_reason: Option<String>,
+    pub draining: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain_reason: Option<String>,
     pub retained_commands: usize,
     pub retained_events: usize,
     pub pending_commands: usize,
@@ -284,6 +293,8 @@ impl BackendSession {
             BackendLifecycleState::Stale
         } else if self.pending_cancel_for_active_task() {
             BackendLifecycleState::Cancelling
+        } else if self.draining_at_ms.is_some() {
+            BackendLifecycleState::Draining
         } else if self.active_task_seq.is_some() {
             BackendLifecycleState::Working
         } else if self.waiting {
@@ -391,6 +402,8 @@ impl ChatGptBackendStore {
                 stale_at_ms: None,
                 stale_reason: None,
                 failed_at_ms: None,
+                draining_at_ms: None,
+                drain_reason: None,
                 waiting: false,
                 last_wait_started_at_ms: None,
                 last_wait_returned_at_ms: None,
@@ -477,6 +490,38 @@ impl ChatGptBackendStore {
                 session.stale_at_ms = Some(now);
                 session.stale_reason = Some(reason);
                 session.waiting = false;
+                session.updated_at_ms = now;
+                self.write_session(&session)?;
+            }
+            Ok(session)
+        })
+    }
+
+    pub fn drain_session(
+        &self,
+        session_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<BackendSession, String> {
+        validate_id(session_id)?;
+        let reason = reason.into();
+        validate_text("drain reason", &reason, MAX_COMMAND_BYTES)?;
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut session = self.read_session(session_id)?;
+            if session.closed_at_ms.is_some() || session.failed_at_ms.is_some() {
+                return Err(format!("ChatGPT backend session {session_id} is not live"));
+            }
+            if mark_session_stale_if_expired(&mut session, now) {
+                self.write_session(&session)?;
+            }
+            if session.stale_at_ms.is_some() {
+                return Err(format!(
+                    "ChatGPT backend session {session_id} is stale; attach a fresh backend session"
+                ));
+            }
+            if session.draining_at_ms.is_none() {
+                session.draining_at_ms = Some(now);
+                session.drain_reason = Some(reason);
                 session.updated_at_ms = now;
                 self.write_session(&session)?;
             }
@@ -686,6 +731,11 @@ impl ChatGptBackendStore {
             if pending >= MAX_PENDING_COMMANDS {
                 return Err(format!(
                     "ChatGPT backend session {session_id} already has {MAX_PENDING_COMMANDS} pending commands"
+                ));
+            }
+            if kind == BackendCommandKind::Task && session.draining_at_ms.is_some() {
+                return Err(format!(
+                    "ChatGPT backend session {session_id} is draining and does not accept new tasks"
                 ));
             }
             if kind == BackendCommandKind::Task
@@ -1170,6 +1220,8 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
         state,
         last_activity_at_ms: session.last_activity_at_ms(),
         stale_reason,
+        draining: session.draining_at_ms.is_some(),
+        drain_reason: session.drain_reason.clone(),
         retained_commands: session.commands.len(),
         retained_events: session.events.len(),
         pending_commands,
@@ -1523,6 +1575,35 @@ mod tests {
             store.inspection(&replacement.id).unwrap().state,
             BackendLifecycleState::Ready
         );
+    }
+
+    #[test]
+    fn drain_is_live_idempotent_and_preserves_first_reason() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+
+        let first = store
+            .drain_session(&session.id, "planned rotation")
+            .unwrap();
+        assert!(first.draining_at_ms.is_some());
+        assert_eq!(first.drain_reason.as_deref(), Some("planned rotation"));
+
+        let second = store
+            .drain_session(&session.id, "later reason")
+            .unwrap();
+        assert_eq!(second.draining_at_ms, first.draining_at_ms);
+        assert_eq!(second.drain_reason.as_deref(), Some("planned rotation"));
+
+        let inspection = store.inspection(&session.id).unwrap();
+        assert_eq!(inspection.state, BackendLifecycleState::Draining);
+        assert!(inspection.live);
+        assert!(inspection.draining);
+        assert_eq!(inspection.drain_reason.as_deref(), Some("planned rotation"));
+
+        let error = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "new work".into())
+            .unwrap_err();
+        assert!(error.contains("draining"));
     }
 
     #[test]

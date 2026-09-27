@@ -103,6 +103,11 @@ pub enum BackendControllerRequest {
         #[serde(default)]
         reason: Option<String>,
     },
+    Drain {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Abandon {
         session_id: String,
         #[serde(default)]
@@ -146,6 +151,8 @@ pub struct ChatGptBackendSessionView {
     pub session_id: String,
     pub state: BackendLifecycleState,
     pub live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<BackendWorkspace>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,6 +268,9 @@ impl ChatGptBackendAdapter {
                 &run_id,
                 reason,
             )?)),
+            BackendControllerRequest::Drain { session_id, reason } => Ok(
+                BackendControllerResponse::Receipt(self.drain(&session_id, reason)?),
+            ),
             BackendControllerRequest::Abandon { session_id, reason } => Ok(
                 BackendControllerResponse::Receipt(self.abandon(&session_id, reason)?),
             ),
@@ -461,6 +471,25 @@ impl ChatGptBackendAdapter {
         })
     }
 
+    pub fn drain(
+        &self,
+        session_id: &str,
+        reason: Option<String>,
+    ) -> BackendAdapterResult<BackendControlReceipt> {
+        self.store
+            .drain_session(
+                session_id,
+                reason.unwrap_or_else(|| "draining by controller".to_string()),
+            )
+            .map_err(BackendAdapterError::from_store)?;
+        Ok(BackendControlReceipt {
+            accepted: true,
+            session_id: session_id.to_string(),
+            run_id: None,
+            action: "drain",
+        })
+    }
+
     pub fn abandon(
         &self,
         session_id: &str,
@@ -546,6 +575,7 @@ impl ChatGptBackendAdapter {
             session_id: inspection.session_id,
             state: inspection.state,
             live: inspection.live,
+            drain_reason: inspection.drain_reason,
             workspace: inspection.workspace,
             active_run_id,
             pending_commands: inspection.pending_commands,
@@ -798,6 +828,101 @@ mod tests {
     }
 
     #[test]
+    fn drain_excludes_worker_from_capacity_and_routes_to_healthy_peer() {
+        let (_root, adapter, store) = adapter();
+        let workspace = BackendWorkspace {
+            active_root: "/workspace/a".into(),
+            source_project_root: Some("/workspace/a".into()),
+            managed_worktree: false,
+            worktree_git_root: None,
+            repository_url: None,
+        };
+        let first = store
+            .attach_with_workspace("worker-a", Some(workspace.clone()))
+            .unwrap();
+        let second = store
+            .attach_with_workspace("worker-b", Some(workspace))
+            .unwrap();
+
+        let receipt = adapter
+            .drain(&second.id, Some("planned rotation".into()))
+            .unwrap();
+        assert_eq!(receipt.action, "drain");
+        let drained = adapter.session(&second.id).unwrap();
+        assert_eq!(drained.state, BackendLifecycleState::Draining);
+        assert!(drained.live);
+        assert_eq!(drained.drain_reason.as_deref(), Some("planned rotation"));
+
+        assert_eq!(
+            adapter.acquire(Some("/workspace/a")).unwrap().session_id,
+            first.id
+        );
+        assert_eq!(
+            adapter.submit_task(&second.id, "new work".into()).unwrap_err().code,
+            BackendAdapterErrorCode::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_active_worker_finishes_current_run_then_accepts_finish() {
+        let (_root, adapter, store) = adapter();
+        let session = store.attach("worker-a").unwrap();
+        let run = adapter.submit_task(&session.id, "current work".into()).unwrap();
+        let outcome = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let task = match outcome {
+            ExchangeOutcome::Command(command) => command,
+            other => panic!("expected task command, got {other:?}"),
+        };
+
+        adapter
+            .drain(&session.id, Some("rotate after current run".into()))
+            .unwrap();
+        assert_eq!(
+            adapter.session(&session.id).unwrap().state,
+            BackendLifecycleState::Draining
+        );
+        assert_eq!(
+            adapter.run(&session.id, &run.run_id).unwrap().state,
+            BackendRunState::Running
+        );
+        assert_eq!(
+            adapter.finish(&session.id).unwrap_err().code,
+            BackendAdapterErrorCode::Busy
+        );
+
+        store
+            .prepare_exchange(
+                "worker-a",
+                &session.id,
+                None,
+                Some(ExchangeOutbound {
+                    kind: BackendEventKind::Result,
+                    command_seq: task.seq,
+                    content: "done".into(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            adapter.run(&session.id, &run.run_id).unwrap().state,
+            BackendRunState::Succeeded
+        );
+        assert_eq!(
+            adapter.session(&session.id).unwrap().state,
+            BackendLifecycleState::Draining
+        );
+        assert_eq!(adapter.finish(&session.id).unwrap().action, "finish");
+    }
+
+    #[test]
     fn abandon_terminalizes_a_stuck_run_as_stale() {
         let (_root, adapter, store) = adapter();
         let session = store.attach("worker-a").unwrap();
@@ -818,9 +943,26 @@ mod tests {
         let (_root, adapter, store) = adapter();
         let session = store.attach("worker-a").unwrap();
 
+        let drain_request: BackendControllerRequest = serde_json::from_value(serde_json::json!({
+            "op": "drain",
+            "session_id": session.id,
+            "reason": "controller rotation"
+        }))
+        .unwrap();
+        let response = adapter.handle_controller_request(drain_request).await.unwrap();
+        let BackendControllerResponse::Receipt(receipt) = response else {
+            panic!("expected drain controller receipt");
+        };
+        assert_eq!(receipt.action, "drain");
+        assert_eq!(
+            adapter.session(&session.id).unwrap().state,
+            BackendLifecycleState::Draining
+        );
+
+        let fresh = store.attach("worker-b").unwrap();
         let request: BackendControllerRequest = serde_json::from_value(serde_json::json!({
             "op": "submit",
-            "session_id": session.id,
+            "session_id": fresh.id,
             "prompt": "controller task"
         }))
         .unwrap();

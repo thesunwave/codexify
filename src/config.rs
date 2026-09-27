@@ -236,6 +236,8 @@ pub enum ChatGptBackendCommand {
     Steer(ChatGptBackendSteerArgs),
     /// Cancel one active backend run.
     Cancel(ChatGptBackendCancelArgs),
+    /// Drain one backend session: finish active work but accept no new tasks.
+    Drain(ChatGptBackendDrainArgs),
     /// Abandon one backend session and mark its active work stale.
     Abandon(ChatGptBackendAbandonArgs),
     /// Finish and release one idle backend session.
@@ -287,6 +289,14 @@ pub struct ChatGptBackendCancelArgs {
     pub session_id: String,
     pub run_id: String,
     pub reason: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendDrainArgs {
+    pub session_id: String,
+    /// Reason recorded when the backend session enters draining state.
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Args, Debug)]
@@ -3435,6 +3445,24 @@ mod tests {
             panic!("chatgpt-backend acquire subcommand was not parsed");
         };
         assert_eq!(args.workspace.as_deref(), Some("/tmp/project"));
+
+        let parsed = Cli::try_parse_from([
+            "codexify",
+            "chatgpt-backend",
+            "drain",
+            "session-1",
+            "--reason",
+            "rotate worker",
+        ])
+        .unwrap();
+        let Some(CliCommand::ChatGptBackend {
+            command: ChatGptBackendCommand::Drain(args),
+        }) = parsed.command
+        else {
+            panic!("chatgpt-backend drain subcommand was not parsed");
+        };
+        assert_eq!(args.session_id, "session-1");
+        assert_eq!(args.reason, "rotate worker");
 
         let parsed = Cli::try_parse_from([
             "codexify",
