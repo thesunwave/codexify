@@ -103,6 +103,11 @@ pub enum BackendControllerRequest {
         #[serde(default)]
         reason: Option<String>,
     },
+    Abandon {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Finish {
         session_id: String,
     },
@@ -256,6 +261,9 @@ impl ChatGptBackendAdapter {
                 &run_id,
                 reason,
             )?)),
+            BackendControllerRequest::Abandon { session_id, reason } => Ok(
+                BackendControllerResponse::Receipt(self.abandon(&session_id, reason)?),
+            ),
             BackendControllerRequest::Finish { session_id } => Ok(
                 BackendControllerResponse::Receipt(self.finish(&session_id)?),
             ),
@@ -450,6 +458,25 @@ impl ChatGptBackendAdapter {
             session_id: session_id.to_string(),
             run_id: Some(run_id.to_string()),
             action: "cancel",
+        })
+    }
+
+    pub fn abandon(
+        &self,
+        session_id: &str,
+        reason: Option<String>,
+    ) -> BackendAdapterResult<BackendControlReceipt> {
+        self.store
+            .abandon_session(
+                session_id,
+                reason.unwrap_or_else(|| "abandoned by controller".to_string()),
+            )
+            .map_err(BackendAdapterError::from_store)?;
+        Ok(BackendControlReceipt {
+            accepted: true,
+            session_id: session_id.to_string(),
+            run_id: None,
+            action: "abandon",
         })
     }
 
@@ -763,6 +790,23 @@ mod tests {
             BackendAdapterErrorCode::Busy
         );
         assert_eq!(run.state, BackendRunState::Queued);
+    }
+
+    #[test]
+    fn abandon_terminalizes_a_stuck_run_as_stale() {
+        let (_root, adapter, store) = adapter();
+        let session = store.attach("worker-a").unwrap();
+        let run = adapter.submit_task(&session.id, "work".into()).unwrap();
+
+        let receipt = adapter
+            .abandon(&session.id, Some("interrupt timed out".into()))
+            .unwrap();
+        assert_eq!(receipt.action, "abandon");
+        assert_eq!(
+            adapter.run(&session.id, &run.run_id).unwrap().state,
+            BackendRunState::Stale
+        );
+        assert!(!adapter.session(&session.id).unwrap().live);
     }
 
     #[tokio::test]

@@ -459,6 +459,31 @@ impl ChatGptBackendStore {
         })
     }
 
+    pub fn abandon_session(
+        &self,
+        session_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<BackendSession, String> {
+        validate_id(session_id)?;
+        let reason = reason.into();
+        validate_text("abandon reason", &reason, MAX_COMMAND_BYTES)?;
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut session = self.read_session(session_id)?;
+            if session.closed_at_ms.is_some() || session.failed_at_ms.is_some() {
+                return Err(format!("ChatGPT backend session {session_id} is not live"));
+            }
+            if session.stale_at_ms.is_none() {
+                session.stale_at_ms = Some(now);
+                session.stale_reason = Some(reason);
+                session.waiting = false;
+                session.updated_at_ms = now;
+                self.write_session(&session)?;
+            }
+            Ok(session)
+        })
+    }
+
     pub fn touch_worker_activity(&self, worker: &str) -> Result<(), String> {
         validate_worker(worker)?;
         self.with_lock(|| {
@@ -1491,6 +1516,33 @@ mod tests {
         assert_eq!(stale.state, BackendLifecycleState::Stale);
         assert!(!stale.live);
         assert_eq!(stale.stale_reason.as_deref(), Some("exchange wait lease expired"));
+
+        let replacement = store.attach("worker-a").unwrap();
+        assert_ne!(replacement.id, first.id);
+        assert_eq!(
+            store.inspection(&replacement.id).unwrap().state,
+            BackendLifecycleState::Ready
+        );
+    }
+
+    #[test]
+    fn explicit_abandon_marks_session_stale_and_allows_fresh_attach() {
+        let (_root, store) = store();
+        let first = store.attach("worker-a").unwrap();
+        store
+            .enqueue_command(&first.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+
+        store
+            .abandon_session(&first.id, "interrupt acknowledgement timed out")
+            .unwrap();
+        let stale = store.inspection(&first.id).unwrap();
+        assert_eq!(stale.state, BackendLifecycleState::Stale);
+        assert!(!stale.live);
+        assert_eq!(
+            stale.stale_reason.as_deref(),
+            Some("interrupt acknowledgement timed out")
+        );
 
         let replacement = store.attach("worker-a").unwrap();
         assert_ne!(replacement.id, first.id);
