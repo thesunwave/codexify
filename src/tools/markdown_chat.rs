@@ -161,12 +161,12 @@ impl Tool for ChatTool {
                 true,
                 "Appends a user-facing message outside the repository and may POST that message to the configured notification provider.",
             ),
-            _ => ToolBehavior::new(
-                true,
+            Self::Read | Self::Await => ToolBehavior::new(
                 false,
                 false,
                 false,
-                "Reads user messages and updates only private read-cursor bookkeeping.",
+                false,
+                "Reads and acknowledges user messages, advancing the conversation's read cursor.",
             ),
         }
     }

@@ -3252,6 +3252,37 @@ mod tests {
     }
 
     #[test]
+    fn chat_receiving_tools_are_non_read_only_unless_annotations_are_forced() {
+        use crate::tools::markdown_chat::ChatTool;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(root.path().to_path_buf());
+        config.markdown_chat.enabled = true;
+        for ticketed in [false, true] {
+            config.experimental.agent_tickets = ticketed;
+            for forced in [false, true] {
+                config.experimental.force_read_only_tool_annotations = forced;
+                for tool in [ChatTool::Read, ChatTool::Await] {
+                    let native = tool.annotations().unwrap();
+                    assert_eq!(native.read_only_hint, Some(false), "{}", tool.name());
+                    let annotations = advertised_tool(&tool, &config).annotations.unwrap();
+                    assert_eq!(
+                        (
+                            annotations.read_only_hint,
+                            annotations.destructive_hint,
+                            annotations.idempotent_hint,
+                            annotations.open_world_hint,
+                        ),
+                        (Some(forced), Some(false), Some(false), Some(false)),
+                        "{}: ticketed={ticketed}, forced={forced}",
+                        tool.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn forced_read_only_tool_annotations_override_every_advertised_tool() {
         let root = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(root.path().to_path_buf());
