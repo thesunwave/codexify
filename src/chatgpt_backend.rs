@@ -15,6 +15,8 @@ const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_COMMANDS: usize = 64;
 const MAX_RETAINED_COMMANDS: usize = 32;
 const MAX_RETAINED_EVENTS: usize = 32;
+const MAX_RETAINED_TOOL_ACTIVITIES: usize = 32;
+const MAX_TOOL_NAME_BYTES: usize = 1024;
 pub const DEFAULT_WAIT_MS: u64 = 115_000;
 const WAIT_LEASE_GRACE_MS: u64 = 30_000;
 const READY_STALE_MS: u64 = 180_000;
@@ -82,6 +84,26 @@ pub struct BackendEvent {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendToolActivityStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendToolActivity {
+    pub seq: u64,
+    pub task_seq: u64,
+    pub tool: String,
+    pub status: BackendToolActivityStatus,
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendWorkspace {
     pub active_root: String,
@@ -104,6 +126,8 @@ pub struct BackendSession {
     pub last_heartbeat_at_ms: u64,
     pub next_command_seq: u64,
     pub next_event_seq: u64,
+    #[serde(default = "default_next_tool_activity_seq")]
+    pub next_tool_activity_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_task_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,6 +161,8 @@ pub struct BackendSession {
     pub failed_tasks: u64,
     pub commands: Vec<BackendCommand>,
     pub events: Vec<BackendEvent>,
+    #[serde(default)]
+    pub tool_activities: Vec<BackendToolActivity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +227,7 @@ pub struct BackendSessionInspection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event: Option<BackendEventSummary>,
     pub tasks: Vec<BackendTaskInspection>,
+    pub tool_activities: Vec<BackendToolActivity>,
     pub timeline: Vec<BackendTimelineEntry>,
 }
 
@@ -242,6 +269,16 @@ pub struct BackendTimelineEntry {
     pub command_kind: Option<BackendCommandKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_kind: Option<BackendEventKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_status: Option<BackendToolActivityStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+fn default_next_tool_activity_seq() -> u64 {
+    1
 }
 
 impl BackendSession {
@@ -404,6 +441,7 @@ impl ChatGptBackendStore {
                 last_heartbeat_at_ms: now,
                 next_command_seq: 1,
                 next_event_seq: 2,
+                next_tool_activity_seq: 1,
                 active_task_seq: None,
                 closed_at_ms: None,
                 stale_at_ms: None,
@@ -428,6 +466,7 @@ impl ChatGptBackendStore {
                     content: ready_content,
                     created_at_ms: now,
                 }],
+                tool_activities: Vec::new(),
             };
             self.write_session(&session)?;
             session.updated_at_ms = now;
@@ -579,6 +618,76 @@ impl ChatGptBackendStore {
             let id = session.id.clone();
             self.write_session(&session)?;
             Ok(Some((id, task_seq)))
+        })
+    }
+
+    pub fn start_tool_activity(
+        &self,
+        session_id: &str,
+        task_seq: u64,
+        tool: &str,
+    ) -> Result<u64, String> {
+        validate_id(session_id)?;
+        validate_text("tool name", tool, MAX_TOOL_NAME_BYTES)?;
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut session = self.read_session(session_id)?;
+            if session.closed_at_ms.is_some()
+                || session.failed_at_ms.is_some()
+                || session.stale_at_ms.is_some()
+                || session.active_task_seq != Some(task_seq)
+            {
+                return Err(format!(
+                    "ChatGPT backend session {session_id} no longer has task {task_seq} active"
+                ));
+            }
+            let seq = session.next_tool_activity_seq.max(1);
+            session.next_tool_activity_seq = seq.saturating_add(1);
+            session.last_heartbeat_at_ms = now;
+            session.updated_at_ms = now;
+            session.tool_activities.push(BackendToolActivity {
+                seq,
+                task_seq,
+                tool: tool.to_string(),
+                status: BackendToolActivityStatus::Running,
+                started_at_ms: now,
+                completed_at_ms: None,
+            });
+            self.write_session(&session)?;
+            Ok(seq)
+        })
+    }
+
+    pub fn complete_tool_activity(
+        &self,
+        session_id: &str,
+        activity_seq: u64,
+        status: BackendToolActivityStatus,
+    ) -> Result<(), String> {
+        validate_id(session_id)?;
+        if status == BackendToolActivityStatus::Running {
+            return Err("completed tool activity status must be terminal".into());
+        }
+        self.with_lock(|| {
+            let now = now_ms()?;
+            let mut session = self.read_session(session_id)?;
+            let Some(activity) = session
+                .tool_activities
+                .iter_mut()
+                .find(|activity| activity.seq == activity_seq)
+            else {
+                return Err(format!(
+                    "unknown ChatGPT backend tool activity {activity_seq} in session {session_id}"
+                ));
+            };
+            if activity.completed_at_ms.is_none() {
+                activity.status = status;
+                activity.completed_at_ms = Some(now);
+                session.last_heartbeat_at_ms = now;
+                session.updated_at_ms = now;
+                self.write_session(&session)?;
+            }
+            Ok(())
         })
     }
 
@@ -1244,6 +1353,9 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
             command_seq: None,
             command_kind: Some(command.kind),
             event_kind: None,
+            tool: None,
+            tool_status: None,
+            duration_ms: None,
         });
         if let Some(at_ms) = command.delivered_at_ms {
             timeline.push(BackendTimelineEntry {
@@ -1253,6 +1365,9 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
                 command_seq: None,
                 command_kind: Some(command.kind),
                 event_kind: None,
+                tool: None,
+                tool_status: None,
+                duration_ms: None,
             });
         }
         if let Some(at_ms) = command.acknowledged_at_ms {
@@ -1263,6 +1378,9 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
                 command_seq: None,
                 command_kind: Some(command.kind),
                 event_kind: None,
+                tool: None,
+                tool_status: None,
+                duration_ms: None,
             });
         }
     }
@@ -1274,7 +1392,36 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
             command_seq: event.command_seq,
             command_kind: None,
             event_kind: Some(event.kind),
+            tool: None,
+            tool_status: None,
+            duration_ms: None,
         });
+    }
+    for activity in &session.tool_activities {
+        timeline.push(BackendTimelineEntry {
+            at_ms: activity.started_at_ms,
+            kind: "tool_started",
+            seq: activity.seq,
+            command_seq: Some(activity.task_seq),
+            command_kind: None,
+            event_kind: None,
+            tool: Some(activity.tool.clone()),
+            tool_status: Some(BackendToolActivityStatus::Running),
+            duration_ms: None,
+        });
+        if let Some(at_ms) = activity.completed_at_ms {
+            timeline.push(BackendTimelineEntry {
+                at_ms,
+                kind: "tool_completed",
+                seq: activity.seq,
+                command_seq: Some(activity.task_seq),
+                command_kind: None,
+                event_kind: None,
+                tool: Some(activity.tool.clone()),
+                tool_status: Some(activity.status),
+                duration_ms: Some(at_ms.saturating_sub(activity.started_at_ms)),
+            });
+        }
     }
     timeline.sort_by_key(|entry| (entry.at_ms, entry.kind, entry.seq));
     BackendSessionInspection {
@@ -1311,6 +1458,7 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
             created_at_ms: event.created_at_ms,
         }),
         tasks,
+        tool_activities: session.tool_activities.clone(),
         timeline,
     }
 }
@@ -1383,6 +1531,23 @@ fn compact_history(session: &mut BackendSession) {
         let remove = session.events.len() - MAX_RETAINED_EVENTS;
         session.events.drain(0..remove);
         session.dropped_events = session.dropped_events.saturating_add(remove as u64);
+    }
+
+    let completed_tool_activities = session
+        .tool_activities
+        .iter()
+        .filter(|activity| activity.completed_at_ms.is_some())
+        .count();
+    let mut remove = completed_tool_activities.saturating_sub(MAX_RETAINED_TOOL_ACTIVITIES);
+    if remove > 0 {
+        session.tool_activities.retain(|activity| {
+            if remove > 0 && activity.completed_at_ms.is_some() {
+                remove -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -1947,6 +2112,109 @@ mod tests {
         assert!(!json.contains("worker-secret-identity"));
         assert!(!json.contains("TOP_SECRET_PROMPT"));
         assert!(!json.contains("TOP_SECRET_RESULT"));
+    }
+
+    #[tokio::test]
+    async fn tool_activity_is_persisted_and_exposed_as_progress_timeline() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("backend");
+        let store = ChatGptBackendStore::new_at(directory.clone());
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let activity_seq = store
+            .start_tool_activity(&session.id, task.seq, "exec_command")
+            .unwrap();
+        let running = store.inspection(&session.id).unwrap();
+        assert_eq!(running.tool_activities.len(), 1);
+        assert_eq!(
+            running.tool_activities[0].status,
+            BackendToolActivityStatus::Running
+        );
+        assert!(running.timeline.iter().any(|entry| {
+            entry.kind == "tool_started"
+                && entry.seq == activity_seq
+                && entry.command_seq == Some(task.seq)
+                && entry.tool.as_deref() == Some("exec_command")
+                && entry.tool_status == Some(BackendToolActivityStatus::Running)
+        }));
+
+        store
+            .complete_tool_activity(
+                &session.id,
+                activity_seq,
+                BackendToolActivityStatus::Succeeded,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = ChatGptBackendStore::new_at(directory);
+        let completed = reopened.inspection(&session.id).unwrap();
+        assert_eq!(
+            completed.tool_activities[0].status,
+            BackendToolActivityStatus::Succeeded
+        );
+        assert!(completed.tool_activities[0].completed_at_ms.is_some());
+        assert!(completed.timeline.iter().any(|entry| {
+            entry.kind == "tool_completed"
+                && entry.seq == activity_seq
+                && entry.command_seq == Some(task.seq)
+                && entry.tool.as_deref() == Some("exec_command")
+                && entry.tool_status == Some(BackendToolActivityStatus::Succeeded)
+                && entry.duration_ms.is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn completed_tool_activity_history_is_bounded_and_sequence_stays_monotonic() {
+        let (_root, store) = store();
+        let session = store.attach("worker-a").unwrap();
+        let task = store
+            .enqueue_command(&session.id, BackendCommandKind::Task, "work".into())
+            .unwrap();
+        store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let total = MAX_RETAINED_TOOL_ACTIVITIES + 8;
+        let mut last_seq = 0;
+        for _ in 0..total {
+            last_seq = store
+                .start_tool_activity(&session.id, task.seq, "read_file")
+                .unwrap();
+            store
+                .complete_tool_activity(
+                    &session.id,
+                    last_seq,
+                    BackendToolActivityStatus::Succeeded,
+                )
+                .unwrap();
+        }
+
+        let current = store.session(&session.id).unwrap();
+        assert_eq!(current.tool_activities.len(), MAX_RETAINED_TOOL_ACTIVITIES);
+        assert_eq!(current.tool_activities.last().unwrap().seq, last_seq);
+        assert_eq!(current.next_tool_activity_seq, last_seq + 1);
+        assert!(current.tool_activities.first().unwrap().seq > 1);
     }
 
     #[tokio::test]

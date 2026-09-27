@@ -790,6 +790,24 @@ mod tests {
             BackendRunState::Running
         );
 
+        let activity_seq = store
+            .start_tool_activity(&session.id, command.seq, "exec_command")
+            .unwrap();
+        let progress = adapter.status(&session.id).unwrap();
+        assert!(progress.timeline.iter().any(|entry| {
+            entry.kind == "tool_started"
+                && entry.seq == activity_seq
+                && entry.command_seq == Some(command.seq)
+                && entry.tool.as_deref() == Some("exec_command")
+        }));
+        store
+            .complete_tool_activity(
+                &session.id,
+                activity_seq,
+                crate::chatgpt_backend::BackendToolActivityStatus::Succeeded,
+            )
+            .unwrap();
+
         store
             .prepare_exchange(
                 "worker-a",
@@ -818,6 +836,12 @@ mod tests {
         assert_eq!(status.session.session_id, session.id);
         assert!(status.timeline.iter().any(|entry| {
             entry.kind == "event" && entry.command_seq == Some(command.seq)
+        }));
+        assert!(status.timeline.iter().any(|entry| {
+            entry.kind == "tool_completed"
+                && entry.seq == activity_seq
+                && entry.tool_status
+                    == Some(crate::chatgpt_backend::BackendToolActivityStatus::Succeeded)
         }));
     }
 

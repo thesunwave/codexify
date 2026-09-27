@@ -689,7 +689,7 @@ impl ServerHandler for CodexHandler {
             .filter(|value| !value.is_empty() && value.len() <= 64)
             .map(str::to_owned);
         let call_id = self.next_tool_call_id.fetch_add(1, Ordering::Relaxed);
-        let backend_active_call = if self.config.experimental.chatgpt_bridge
+        let backend_active_task = if self.config.experimental.chatgpt_bridge
             && model_call
             && !matches!(
                 name.as_str(),
@@ -698,18 +698,33 @@ impl ServerHandler for CodexHandler {
             && let Some(identity) = conversation.as_ref()
         {
             match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config)
-                .and_then(|store| store.active_task_for_worker(identity.stable_key()))
             {
-                Ok(Some((_session_id, _task_seq))) => true,
-                Ok(None) => false,
+                Ok(store) => match store.active_task_for_worker(identity.stable_key()) {
+                    Ok(Some((session_id, task_seq))) => {
+                        let activity_seq = match store.start_tool_activity(&session_id, task_seq, &name) {
+                            Ok(seq) => Some(seq),
+                            Err(error) => {
+                                tracing::warn!(%error, tool = %name, "could not record ChatGPT backend tool start");
+                                None
+                            }
+                        };
+                        Some((store, session_id, activity_seq))
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not inspect active ChatGPT backend task");
+                        None
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(%error, "could not inspect active ChatGPT backend task");
-                    false
+                    None
                 }
             }
         } else {
-            false
+            None
         };
+        let backend_active_call = backend_active_task.is_some();
         // Preserve the historical server cancellation identity for every ordinary
         // call. Only an active ChatGPT backend task gets an independently cancellable
         // child token so Paseo can interrupt that one tool call without cancelling the
@@ -822,42 +837,32 @@ impl ServerHandler for CodexHandler {
             )
             && let Some(identity) = conversation.as_ref()
         {
-            match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config) {
-                Ok(store) => match store.active_task_for_worker(identity.stable_key()) {
-                    Ok(Some((_session_id, _task_seq))) => {
-                        let worker = identity.stable_key().to_string();
-                        let cancellation = tool_cancellation.clone();
-                        Some(tokio::spawn(async move {
-                            loop {
-                                if cancellation.is_cancelled() {
-                                    return;
-                                }
-                                match store.pending_cancel_for_worker(&worker) {
-                                    Ok(Some((_session_id, _command))) => {
-                                        cancellation.cancel();
-                                        return;
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => {
-                                        tracing::warn!(%error, "could not inspect ChatGPT backend cancellation queue");
-                                        return;
-                                    }
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                        }))
+            let store = backend_active_task
+                .as_ref()
+                .expect("active backend call has task context")
+                .0
+                .clone();
+            let worker = identity.stable_key().to_string();
+            let cancellation = tool_cancellation.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    if cancellation.is_cancelled() {
+                        return;
                     }
-                    Ok(None) => None,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not inspect active ChatGPT backend task");
-                        None
+                    match store.pending_cancel_for_worker(&worker) {
+                        Ok(Some((_session_id, _command))) => {
+                            cancellation.cancel();
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "could not inspect ChatGPT backend cancellation queue");
+                            return;
+                        }
                     }
-                },
-                Err(error) => {
-                    tracing::warn!(%error, "could not open ChatGPT backend cancellation store");
-                    None
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-            }
+            }))
         } else {
             None
         };
@@ -1175,6 +1180,18 @@ impl ServerHandler for CodexHandler {
         }
 
         let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if let Some((store, session_id, Some(activity_seq))) = backend_active_task.as_ref() {
+            let status = if tool_cancellation.is_cancelled() {
+                crate::chatgpt_backend::BackendToolActivityStatus::Cancelled
+            } else if result.is_error {
+                crate::chatgpt_backend::BackendToolActivityStatus::Failed
+            } else {
+                crate::chatgpt_backend::BackendToolActivityStatus::Succeeded
+            };
+            if let Err(error) = store.complete_tool_activity(session_id, *activity_seq, status) {
+                tracing::warn!(%error, tool = %name, "could not record ChatGPT backend tool completion");
+            }
+        }
         widget_debug::attach_configured_tool_timing(&self.config, &mut result, &name, duration_ms);
         if let (Some(logger), Some(call)) = (&self.tool_logging, tool_log_call.as_ref()) {
             logger.finish(call, &call_identity, &result, duration_ms);
