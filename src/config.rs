@@ -750,6 +750,7 @@ struct PartialExperimental {
     chatgpt_bridge: Option<bool>,
     chatgpt_backend_controller_socket: Option<String>,
     chatgpt_backend_controller_allowed_uid: Option<u32>,
+    chatgpt_backend_delegated_roots: Option<Vec<String>>,
     force_read_only_tool_annotations: Option<bool>,
     claude_skills: Option<bool>,
 }
@@ -1835,6 +1836,17 @@ fn load_config_with_announcements(
                 .into(),
         );
     }
+    let chatgpt_backend_delegated_roots = experimental
+        .chatgpt_backend_delegated_roots
+        .unwrap_or_default()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    if chatgpt_backend_delegated_roots.iter().any(|path| !path.is_absolute()) {
+        return Err(
+            "experimental.chatgptBackendDelegatedRoots entries must be absolute paths".into(),
+        );
+    }
     let config = AppConfig {
         work_dir,
         debug: file.debug.unwrap_or(false),
@@ -1845,6 +1857,7 @@ fn load_config_with_announcements(
             chatgpt_backend_controller_socket,
             chatgpt_backend_controller_allowed_uid: experimental
                 .chatgpt_backend_controller_allowed_uid,
+            chatgpt_backend_delegated_roots,
             force_read_only_tool_annotations: experimental
                 .force_read_only_tool_annotations
                 .or(file.force_read_only_tool_annotations)
@@ -2153,6 +2166,12 @@ mod tests {
                 .is_none()
         );
         assert!(
+            default_config(root.path().to_path_buf())
+                .experimental
+                .chatgpt_backend_delegated_roots
+                .is_empty()
+        );
+        assert!(
             !default_config(root.path().to_path_buf())
                 .experimental
                 .claude_skills
@@ -2204,6 +2223,7 @@ mod tests {
                     "chatgptBridge": true,
                     "chatgptBackendControllerSocket": controller_socket,
                     "chatgptBackendControllerAllowedUid": 501,
+                    "chatgptBackendDelegatedRoots": [root.path().join("delegated")],
                     "forceReadOnlyToolAnnotations": true,
                     "claudeSkills": true
                 }
@@ -2222,6 +2242,10 @@ mod tests {
         assert_eq!(
             config.experimental.chatgpt_backend_controller_allowed_uid,
             Some(501)
+        );
+        assert_eq!(
+            config.experimental.chatgpt_backend_delegated_roots,
+            vec![root.path().join("delegated")]
         );
         assert!(config.experimental.force_read_only_tool_annotations);
         assert!(config.experimental.claude_skills);
@@ -2244,6 +2268,10 @@ mod tests {
             serde_json::json!({
                 "chatgptBridge": true,
                 "chatgptBackendControllerAllowedUid": 501
+            }),
+            serde_json::json!({
+                "chatgptBridge": true,
+                "chatgptBackendDelegatedRoots": ["relative/path"]
             }),
         ] {
             std::fs::write(
@@ -2491,6 +2519,7 @@ mod tests {
                 &[
                     "agentTickets",
                     "chatgptBackendControllerAllowedUid",
+                    "chatgptBackendDelegatedRoots",
                     "chatgptBackendControllerSocket",
                     "chatgptBridge",
                     "forceReadOnlyToolAnnotations",

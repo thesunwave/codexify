@@ -790,6 +790,7 @@ pub struct ExperimentalConfig {
     pub chatgpt_bridge: bool,
     pub chatgpt_backend_controller_socket: Option<std::path::PathBuf>,
     pub chatgpt_backend_controller_allowed_uid: Option<u32>,
+    pub chatgpt_backend_delegated_roots: Vec<std::path::PathBuf>,
     /// The real tool behavior remains authoritative for dispatch and authorization.
     pub force_read_only_tool_annotations: bool,
     pub claude_skills: bool,

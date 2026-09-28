@@ -595,7 +595,10 @@ impl ChatGptBackendStore {
         })
     }
 
-    pub fn active_task_for_worker(&self, worker: &str) -> Result<Option<(String, u64)>, String> {
+    pub fn active_task_for_worker(
+        &self,
+        worker: &str,
+    ) -> Result<Option<(String, u64, Option<BackendWorkspace>)>, String> {
         validate_worker(worker)?;
         self.with_lock(|| {
             let mut sessions = self.read_all()?;
@@ -616,8 +619,9 @@ impl ChatGptBackendStore {
                 .active_task_seq
                 .expect("active backend session search guarantees an active task");
             let id = session.id.clone();
+            let workspace = session.workspace.clone();
             self.write_session(&session)?;
-            Ok(Some((id, task_seq)))
+            Ok(Some((id, task_seq, workspace)))
         })
     }
 
@@ -813,37 +817,72 @@ impl ChatGptBackendStore {
         workspace: Option<&str>,
         content: String,
     ) -> Result<Option<(String, BackendCommand)>, String> {
+        self.enqueue_task_on_available_session_inner(workspace, None, content)
+    }
+
+    pub fn enqueue_task_on_available_session_rebinding(
+        &self,
+        workspace: BackendWorkspace,
+        content: String,
+    ) -> Result<Option<(String, BackendCommand)>, String> {
+        let active_root = workspace.active_root.clone();
+        self.enqueue_task_on_available_session_inner(Some(&active_root), Some(workspace), content)
+    }
+
+    fn enqueue_task_on_available_session_inner(
+        &self,
+        workspace: Option<&str>,
+        rebind_workspace: Option<BackendWorkspace>,
+        content: String,
+    ) -> Result<Option<(String, BackendCommand)>, String> {
         validate_text("command", &content, MAX_COMMAND_BYTES)?;
         self.with_lock(|| {
             let now = now_ms()?;
             let mut sessions = self.read_all()?;
-            let mut candidate = None::<(usize, u64, u64)>;
+            let mut exact = None::<(usize, u64, u64)>;
+            let mut fallback = None::<(usize, u64, u64)>;
             for (index, session) in sessions.iter_mut().enumerate() {
                 if mark_session_stale_if_expired(session, now) {
                     self.write_session(session)?;
                 }
-                if !session_accepts_task(session, now)
-                    || workspace.is_some_and(|expected| {
-                        session
-                            .workspace
-                            .as_ref()
-                            .is_none_or(|actual| actual.active_root != expected)
-                    })
-                {
+                if !session_accepts_task(session, now) {
                     continue;
                 }
                 let key = (index, session.last_activity_at_ms(), session.created_at_ms);
-                if candidate
-                    .as_ref()
-                    .is_none_or(|(_, activity, created)| key.1 > *activity || (key.1 == *activity && key.2 > *created))
+                let matches_workspace = workspace.is_none_or(|expected| {
+                    session
+                        .workspace
+                        .as_ref()
+                        .is_some_and(|actual| actual.active_root == expected)
+                });
+                if matches_workspace {
+                    if exact
+                        .as_ref()
+                        .is_none_or(|(_, activity, created)| key.1 > *activity || (key.1 == *activity && key.2 > *created))
+                    {
+                        exact = Some(key);
+                    }
+                } else if rebind_workspace.is_some()
+                    && fallback
+                        .as_ref()
+                        .is_none_or(|(_, activity, created)| key.1 > *activity || (key.1 == *activity && key.2 > *created))
                 {
-                    candidate = Some(key);
+                    fallback = Some(key);
                 }
             }
-            let Some((index, _, _)) = candidate else {
+            let Some((index, _, _)) = exact.or(fallback) else {
                 return Ok(None);
             };
             let session = &mut sessions[index];
+            if let Some(workspace) = rebind_workspace
+                && session
+                    .workspace
+                    .as_ref()
+                    .is_none_or(|current| current.active_root != workspace.active_root)
+            {
+                session.workspace = Some(workspace);
+                session.updated_at_ms = now;
+            }
             let command = enqueue_command_in_session(
                 session,
                 BackendCommandKind::Task,
@@ -1903,7 +1942,7 @@ mod tests {
 
         assert_eq!(
             store.active_task_for_worker("worker-a").unwrap(),
-            Some((session.id.clone(), task.seq))
+            Some((session.id.clone(), task.seq, None))
         );
         let inspection = store.inspection(&session.id).unwrap();
         assert_eq!(inspection.state, BackendLifecycleState::Working);

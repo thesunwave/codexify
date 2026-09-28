@@ -700,7 +700,7 @@ impl ServerHandler for CodexHandler {
             match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config)
             {
                 Ok(store) => match store.active_task_for_worker(identity.stable_key()) {
-                    Ok(Some((session_id, task_seq))) => {
+                    Ok(Some((session_id, task_seq, workspace))) => {
                         let activity_seq = match store.start_tool_activity(&session_id, task_seq, &name) {
                             Ok(seq) => Some(seq),
                             Err(error) => {
@@ -708,7 +708,7 @@ impl ServerHandler for CodexHandler {
                                 None
                             }
                         };
-                        Some((store, session_id, activity_seq))
+                        Some((store, session_id, activity_seq, workspace))
                     }
                     Ok(None) => None,
                     Err(error) => {
@@ -757,14 +757,22 @@ impl ServerHandler for CodexHandler {
         let authorized_before = self
             .conversation_auth_error("chat_read", conversation.as_ref())
             .is_none();
+        let backend_workspace_root = backend_active_task
+            .as_ref()
+            .and_then(|(_, _, _, workspace)| workspace.as_ref())
+            .map(|workspace| std::path::PathBuf::from(&workspace.active_root));
         let workspace_at_start = if model_call && authorized_before {
-            match conversation.as_ref() {
-                Some(identity) => {
-                    self.project_bindings
-                        .dispatch_workspace(&self.config, identity)
-                        .await
+            if let Some(root) = backend_workspace_root {
+                Ok((Some(root), None))
+            } else {
+                match conversation.as_ref() {
+                    Some(identity) => {
+                        self.project_bindings
+                            .dispatch_workspace(&self.config, identity)
+                            .await
+                    }
+                    None => self.session.dispatch_workspace(&self.config).await,
                 }
-                None => self.session.dispatch_workspace(&self.config).await,
             }
         } else {
             Ok((None, None))
@@ -1180,7 +1188,7 @@ impl ServerHandler for CodexHandler {
         }
 
         let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        if let Some((store, session_id, Some(activity_seq))) = backend_active_task.as_ref() {
+        if let Some((store, session_id, Some(activity_seq), _)) = backend_active_task.as_ref() {
             let status = if tool_cancellation.is_cancelled() {
                 crate::chatgpt_backend::BackendToolActivityStatus::Cancelled
             } else if result.is_error {

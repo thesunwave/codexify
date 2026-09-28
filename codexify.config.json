@@ -8,6 +8,7 @@
     "chatgptBridge": false,
     "chatgptBackendControllerSocket": null,
     "chatgptBackendControllerAllowedUid": null,
+    "chatgptBackendDelegatedRoots": [],
     "forceReadOnlyToolAnnotations": false,
     "claudeSkills": false
   },

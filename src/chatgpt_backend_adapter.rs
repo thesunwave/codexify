@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::chatgpt_backend::{
@@ -85,6 +86,8 @@ pub enum BackendControllerRequest {
     Dispatch {
         #[serde(default)]
         workspace: Option<String>,
+        #[serde(default)]
+        rebind: bool,
         prompt: String,
     },
     Status {
@@ -223,19 +226,28 @@ pub struct BackendControlReceipt {
 #[derive(Debug, Clone)]
 pub struct ChatGptBackendAdapter {
     store: ChatGptBackendStore,
+    delegated_roots: Vec<PathBuf>,
 }
 
 impl ChatGptBackendAdapter {
     pub fn for_current_user(config: &AppConfig) -> BackendAdapterResult<Self> {
+        let mut delegated_roots = vec![config.work_dir.clone()];
+        delegated_roots.extend(config.experimental.chatgpt_backend_delegated_roots.clone());
         Ok(Self {
             store: ChatGptBackendStore::for_current_user(config)
                 .map_err(BackendAdapterError::from_store)?,
+            delegated_roots,
         })
     }
 
-    pub fn new_at(directory: std::path::PathBuf) -> Self {
+    pub fn new_at(directory: PathBuf) -> Self {
+        Self::new_at_with_delegated_roots(directory, Vec::new())
+    }
+
+    pub fn new_at_with_delegated_roots(directory: PathBuf, delegated_roots: Vec<PathBuf>) -> Self {
         Self {
             store: ChatGptBackendStore::new_at(directory),
+            delegated_roots,
         }
     }
 
@@ -253,9 +265,21 @@ impl ChatGptBackendAdapter {
             BackendControllerRequest::Acquire { workspace } => Ok(
                 BackendControllerResponse::Session(self.acquire(workspace.as_deref())?),
             ),
-            BackendControllerRequest::Dispatch { workspace, prompt } => Ok(
-                BackendControllerResponse::Run(self.dispatch_task(workspace.as_deref(), prompt)?),
-            ),
+            BackendControllerRequest::Dispatch {
+                workspace,
+                rebind,
+                prompt,
+            } => Ok(BackendControllerResponse::Run(if rebind {
+                let workspace = workspace.as_deref().ok_or_else(|| {
+                    BackendAdapterError::new(
+                        BackendAdapterErrorCode::InvalidArgument,
+                        "workspace is required when dispatch rebind is enabled",
+                    )
+                })?;
+                self.dispatch_task_rebinding(workspace, prompt)?
+            } else {
+                self.dispatch_task(workspace.as_deref(), prompt)?
+            })),
             BackendControllerRequest::Status { session_id } => {
                 Ok(BackendControllerResponse::Status(self.status(&session_id)?))
             }
@@ -412,6 +436,76 @@ impl ChatGptBackendAdapter {
             )
         })?;
         self.session_view(inspection)
+    }
+
+    fn delegated_workspace(&self, workspace: &str) -> BackendAdapterResult<BackendWorkspace> {
+        let requested = Path::new(workspace);
+        if !requested.is_absolute() {
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::InvalidArgument,
+                "delegated ChatGPT backend workspace must be an absolute path",
+            ));
+        }
+        let canonical = std::fs::canonicalize(requested).map_err(|error| {
+            BackendAdapterError::new(
+                BackendAdapterErrorCode::Conflict,
+                format!(
+                    "cannot access delegated ChatGPT backend workspace {workspace}: {error}"
+                ),
+            )
+        })?;
+        if !canonical.is_dir() {
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::InvalidArgument,
+                format!("delegated ChatGPT backend workspace is not a directory: {workspace}"),
+            ));
+        }
+        let allowed = self.delegated_roots.iter().any(|root| {
+            std::fs::canonicalize(root)
+                .ok()
+                .is_some_and(|root| canonical == root || canonical.starts_with(&root))
+        });
+        if !allowed {
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::Conflict,
+                format!(
+                    "delegated ChatGPT backend workspace is outside the configured delegated roots: {workspace}"
+                ),
+            ));
+        }
+        Ok(BackendWorkspace {
+            active_root: canonical.to_string_lossy().into_owned(),
+            source_project_root: None,
+            managed_worktree: false,
+            worktree_git_root: None,
+            repository_url: None,
+        })
+    }
+
+    pub fn dispatch_task_rebinding(
+        &self,
+        workspace: &str,
+        prompt: String,
+    ) -> BackendAdapterResult<ChatGptBackendRunView> {
+        let workspace = self.delegated_workspace(workspace)?;
+        let active_root = workspace.active_root.clone();
+        let Some((session_id, command)) = self
+            .store
+            .enqueue_task_on_available_session_rebinding(workspace, prompt)
+            .map_err(BackendAdapterError::from_store)?
+        else {
+            let capacity = self.pool(None)?;
+            return Err(BackendAdapterError::new(
+                BackendAdapterErrorCode::Unavailable,
+                format!(
+                    "no ChatGPT backend capacity is available for delegated workspace {active_root} (busy={}, draining={}, unavailable={})",
+                    capacity.busy_sessions,
+                    capacity.draining_sessions,
+                    capacity.unavailable_sessions,
+                ),
+            ));
+        };
+        self.run(&session_id, &command.id)
     }
 
     pub fn dispatch_task(
@@ -994,6 +1088,85 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, BackendAdapterErrorCode::Unavailable);
         assert!(error.message.contains("busy=2"));
+    }
+
+    #[tokio::test]
+    async fn delegated_dispatch_rebinds_only_idle_workers_inside_allowed_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("backend");
+        let delegated = root.path().join("delegated");
+        let workspace_a = delegated.join("a");
+        let workspace_b = delegated.join("b");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&workspace_a).unwrap();
+        std::fs::create_dir_all(&workspace_b).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let adapter = ChatGptBackendAdapter::new_at_with_delegated_roots(
+            directory.clone(),
+            vec![delegated],
+        );
+        let store = ChatGptBackendStore::new_at(directory);
+        let initial_workspace = BackendWorkspace {
+            active_root: workspace_a.to_string_lossy().into_owned(),
+            source_project_root: Some(workspace_a.to_string_lossy().into_owned()),
+            managed_worktree: false,
+            worktree_git_root: None,
+            repository_url: None,
+        };
+        let session = store
+            .attach_with_workspace("worker-a", Some(initial_workspace.clone()))
+            .unwrap();
+
+        let denied = adapter
+            .dispatch_task_rebinding(&outside.to_string_lossy(), "denied".into())
+            .unwrap_err();
+        assert_eq!(denied.code, BackendAdapterErrorCode::Conflict);
+        assert_eq!(
+            store.inspection(&session.id).unwrap().workspace,
+            Some(initial_workspace)
+        );
+
+        let run = adapter
+            .dispatch_task_rebinding(&workspace_b.to_string_lossy(), "work".into())
+            .unwrap();
+        assert_eq!(run.session_id, session.id);
+        let canonical_workspace_b = std::fs::canonicalize(&workspace_b)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let inspection = store.inspection(&session.id).unwrap();
+        assert_eq!(
+            inspection.workspace.as_ref().map(|workspace| workspace.active_root.as_str()),
+            Some(canonical_workspace_b.as_str())
+        );
+        let delivered = store
+            .exchange_wait(
+                "worker-a",
+                &session.id,
+                false,
+                0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let task = match delivered {
+            ExchangeOutcome::Command(command) => command,
+            other => panic!("expected delegated task command, got {other:?}"),
+        };
+        assert_eq!(
+            store.active_task_for_worker("worker-a").unwrap(),
+            Some((session.id.clone(), task.seq, inspection.workspace.clone()))
+        );
+
+        let busy = adapter
+            .dispatch_task_rebinding(&workspace_a.to_string_lossy(), "second".into())
+            .unwrap_err();
+        assert_eq!(busy.code, BackendAdapterErrorCode::Unavailable);
+        assert_eq!(
+            store.inspection(&session.id).unwrap().workspace,
+            inspection.workspace
+        );
     }
 
     #[test]
