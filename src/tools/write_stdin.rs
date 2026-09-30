@@ -127,21 +127,22 @@ impl Tool for WriteStdin {
         // process so a runaway or blocking command can be stopped.
         let is_interrupt = chars == "\u{0003}";
 
+        let mut write_error = None;
         if !is_poll {
-            if let Some(code) = exec_session.exit_code() {
-                return ToolResult::error(format!(
-                    "Session {session_id} has already exited with code {code}; cannot write to stdin."
-                ));
-            }
             if is_interrupt {
                 exec_session.interrupt();
-            } else if let Err(e) = exec_session.write_stdin(&chars).await {
-                return ToolResult::error(e.to_string());
+            } else if exec_session.exit_code().is_none()
+                && let Err(error) = exec_session.write_stdin(&chars).await
+            {
+                write_error = Some(error);
             }
         }
 
         let (output, exited, buffer_truncated) =
             exec_session.yield_output_with_metadata(yield_ms).await;
+        if !exited && let Some(error) = write_error {
+            return ToolResult::error(error.to_string());
+        }
         let (text, original_token_count, truncated) = truncate_output(&output, max_output_tokens);
 
         let mut result = UnifiedExecOutput {

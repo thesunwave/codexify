@@ -1894,6 +1894,14 @@ mod tests {
         }
     }
 
+    fn short_success_command() -> String {
+        match shell_type_of(&default_shell_bin()) {
+            ShellType::PowerShell => "Start-Sleep -Milliseconds 50".to_string(),
+            ShellType::Cmd => "ping 127.0.0.1 -n 2 > nul".to_string(),
+            ShellType::Posix => "sleep 0.05".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn conversation_owned_exec_session_survives_replacement_transport() {
         let dir = std::env::temp_dir();
@@ -1953,6 +1961,75 @@ mod tests {
 
         replacement_call.remove_exec_session(session_id);
         kill_exec_session(&resident);
+    }
+
+    #[tokio::test]
+    async fn write_stdin_after_process_exit_returns_terminal_result_and_reaps_session() {
+        let dir = std::env::temp_dir();
+        let config = crate::config::default_config(dir.clone());
+        let state = SessionState::new();
+        let session =
+            start_exec_session(&state, &config, &short_success_command(), &dir, None).unwrap();
+        let session_id = session.id;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.exit_code().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("short command should exit");
+
+        let result = WriteStdin
+            .call(
+                json!({
+                    "session_id": session_id,
+                    "chars": "x",
+                    "yield_time_ms": 1
+                }),
+                &config,
+                &state,
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.joined_text());
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("terminal write_stdin result should be structured");
+        assert!(structured.get("exit_code").is_some());
+        assert!(structured.get("session_id").is_none());
+        assert!(state.exec_session(session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn write_stdin_failure_for_live_process_remains_an_error() {
+        let dir = std::env::temp_dir();
+        let config = crate::config::default_config(dir.clone());
+        let state = SessionState::new();
+        let session =
+            start_exec_session(&state, &config, &resident_sleep_command(), &dir, None).unwrap();
+        let session_id = session.id;
+        *session.stdin.lock().await = None;
+
+        let result = WriteStdin
+            .call(
+                json!({
+                    "session_id": session_id,
+                    "chars": "x",
+                    "yield_time_ms": 1
+                }),
+                &config,
+                &state,
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.joined_text().contains("stdin is not available"));
+        assert!(state.exec_session(session_id).is_some());
+
+        state.remove_exec_session(session_id);
+        kill_exec_session(&session);
     }
 
     #[test]
