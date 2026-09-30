@@ -19,6 +19,9 @@ pub(crate) fn schema_version(config: &AppConfig) -> String {
     if config.experimental.agent_tickets {
         version.push_str("+tickets-v1");
     }
+    if config.experimental.chatgpt_bridge {
+        version.push_str("+chatgpt-bridge-v4");
+    }
     if config.multi_project {
         version.push_str("+workspace-v1");
     }
