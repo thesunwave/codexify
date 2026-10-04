@@ -17,6 +17,7 @@ const MAX_RETAINED_COMMANDS: usize = 32;
 const MAX_RETAINED_EVENTS: usize = 32;
 const MAX_RETAINED_TOOL_ACTIVITIES: usize = 32;
 const MAX_TOOL_NAME_BYTES: usize = 1024;
+const MAX_TOOL_PREVIEW_BYTES: usize = 16 * 1024;
 pub const DEFAULT_WAIT_MS: u64 = 115_000;
 const WAIT_LEASE_GRACE_MS: u64 = 30_000;
 const READY_STALE_MS: u64 = 180_000;
@@ -98,6 +99,10 @@ pub struct BackendToolActivity {
     pub seq: u64,
     pub task_seq: u64,
     pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_preview: Option<String>,
     pub status: BackendToolActivityStatus,
     pub started_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,6 +280,10 @@ pub struct BackendTimelineEntry {
     pub tool_status: Option<BackendToolActivityStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_preview: Option<String>,
 }
 
 fn default_next_tool_activity_seq() -> u64 {
@@ -631,8 +640,21 @@ impl ChatGptBackendStore {
         task_seq: u64,
         tool: &str,
     ) -> Result<u64, String> {
+        self.start_tool_activity_with_preview(session_id, task_seq, tool, None)
+    }
+
+    pub fn start_tool_activity_with_preview(
+        &self,
+        session_id: &str,
+        task_seq: u64,
+        tool: &str,
+        request_preview: Option<String>,
+    ) -> Result<u64, String> {
         validate_id(session_id)?;
         validate_text("tool name", tool, MAX_TOOL_NAME_BYTES)?;
+        if let Some(preview) = request_preview.as_deref() {
+            validate_text("tool request preview", preview, MAX_TOOL_PREVIEW_BYTES)?;
+        }
         self.with_lock(|| {
             let now = now_ms()?;
             let mut session = self.read_session(session_id)?;
@@ -653,6 +675,8 @@ impl ChatGptBackendStore {
                 seq,
                 task_seq,
                 tool: tool.to_string(),
+                request_preview,
+                response_preview: None,
                 status: BackendToolActivityStatus::Running,
                 started_at_ms: now,
                 completed_at_ms: None,
@@ -668,9 +692,22 @@ impl ChatGptBackendStore {
         activity_seq: u64,
         status: BackendToolActivityStatus,
     ) -> Result<(), String> {
+        self.complete_tool_activity_with_preview(session_id, activity_seq, status, None)
+    }
+
+    pub fn complete_tool_activity_with_preview(
+        &self,
+        session_id: &str,
+        activity_seq: u64,
+        status: BackendToolActivityStatus,
+        response_preview: Option<String>,
+    ) -> Result<(), String> {
         validate_id(session_id)?;
         if status == BackendToolActivityStatus::Running {
             return Err("completed tool activity status must be terminal".into());
+        }
+        if let Some(preview) = response_preview.as_deref() {
+            validate_text("tool response preview", preview, MAX_TOOL_PREVIEW_BYTES)?;
         }
         self.with_lock(|| {
             let now = now_ms()?;
@@ -686,6 +723,7 @@ impl ChatGptBackendStore {
             };
             if activity.completed_at_ms.is_none() {
                 activity.status = status;
+                activity.response_preview = response_preview;
                 activity.completed_at_ms = Some(now);
                 session.last_heartbeat_at_ms = now;
                 session.updated_at_ms = now;
@@ -1395,6 +1433,8 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
             tool: None,
             tool_status: None,
             duration_ms: None,
+            request_preview: None,
+            response_preview: None,
         });
         if let Some(at_ms) = command.delivered_at_ms {
             timeline.push(BackendTimelineEntry {
@@ -1407,6 +1447,8 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
                 tool: None,
                 tool_status: None,
                 duration_ms: None,
+                request_preview: None,
+                response_preview: None,
             });
         }
         if let Some(at_ms) = command.acknowledged_at_ms {
@@ -1420,6 +1462,8 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
                 tool: None,
                 tool_status: None,
                 duration_ms: None,
+                request_preview: None,
+                response_preview: None,
             });
         }
     }
@@ -1434,6 +1478,8 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
             tool: None,
             tool_status: None,
             duration_ms: None,
+            request_preview: None,
+            response_preview: None,
         });
     }
     for activity in &session.tool_activities {
@@ -1447,6 +1493,8 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
             tool: Some(activity.tool.clone()),
             tool_status: Some(BackendToolActivityStatus::Running),
             duration_ms: None,
+            request_preview: activity.request_preview.clone(),
+            response_preview: None,
         });
         if let Some(at_ms) = activity.completed_at_ms {
             timeline.push(BackendTimelineEntry {
@@ -1459,6 +1507,8 @@ fn inspect_session(session: BackendSession, now: u64) -> BackendSessionInspectio
                 tool: Some(activity.tool.clone()),
                 tool_status: Some(activity.status),
                 duration_ms: Some(at_ms.saturating_sub(activity.started_at_ms)),
+                request_preview: activity.request_preview.clone(),
+                response_preview: activity.response_preview.clone(),
             });
         }
     }
@@ -2174,7 +2224,12 @@ mod tests {
             .unwrap();
 
         let activity_seq = store
-            .start_tool_activity(&session.id, task.seq, "exec_command")
+            .start_tool_activity_with_preview(
+                &session.id,
+                task.seq,
+                "exec_command",
+                Some(r#"{"cmd":"git status --short --branch"}"#.into()),
+            )
             .unwrap();
         let running = store.inspection(&session.id).unwrap();
         assert_eq!(running.tool_activities.len(), 1);
@@ -2188,13 +2243,17 @@ mod tests {
                 && entry.command_seq == Some(task.seq)
                 && entry.tool.as_deref() == Some("exec_command")
                 && entry.tool_status == Some(BackendToolActivityStatus::Running)
+                && entry.request_preview.as_deref()
+                    == Some(r#"{"cmd":"git status --short --branch"}"#)
+                && entry.response_preview.is_none()
         }));
 
         store
-            .complete_tool_activity(
+            .complete_tool_activity_with_preview(
                 &session.id,
                 activity_seq,
                 BackendToolActivityStatus::Succeeded,
+                Some(r#"{"structuredContent":{"output":"clean","exit_code":0}}"#.into()),
             )
             .unwrap();
         drop(store);
@@ -2213,6 +2272,10 @@ mod tests {
                 && entry.tool.as_deref() == Some("exec_command")
                 && entry.tool_status == Some(BackendToolActivityStatus::Succeeded)
                 && entry.duration_ms.is_some()
+                && entry.request_preview.as_deref()
+                    == Some(r#"{"cmd":"git status --short --branch"}"#)
+                && entry.response_preview.as_deref()
+                    == Some(r#"{"structuredContent":{"output":"clean","exit_code":0}}"#)
         }));
     }
 

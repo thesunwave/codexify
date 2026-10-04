@@ -292,6 +292,42 @@ impl ToolCallLogger {
     }
 }
 
+pub(crate) fn backend_request_preview(
+    config: &AppConfig,
+    value: &Value,
+    schema: Option<&Value>,
+    max_bytes: usize,
+) -> String {
+    let traversal_truncated = Cell::new(false);
+    let redactor = SecretRedactor::for_tool_logging(config);
+    let redacted = redactor.redacted_json(value, schema, max_bytes, &traversal_truncated);
+    preview_serializable(&redacted, max_bytes, &traversal_truncated).text
+}
+
+pub(crate) fn backend_response_preview(
+    config: &AppConfig,
+    result: &ToolResult,
+    max_bytes: usize,
+) -> String {
+    let traversal_truncated = Cell::new(false);
+    if result.audit.sensitive_output {
+        return preview_serializable(
+            &"<private Markdown chat history>",
+            max_bytes,
+            &traversal_truncated,
+        )
+        .text;
+    }
+    let redactor = SecretRedactor::for_tool_logging(config);
+    let response = LoggableToolResult {
+        result,
+        redactor: &redactor,
+        max_payload_bytes: max_bytes,
+        traversal_truncated: &traversal_truncated,
+    };
+    preview_serializable(&response, max_bytes, &traversal_truncated).text
+}
+
 struct LoggableToolResult<'a> {
     result: &'a ToolResult,
     redactor: &'a SecretRedactor,
@@ -698,6 +734,32 @@ mod tests {
         assert!(preview.serialization_failed);
         assert!(preview.truncated);
         assert!(!preview.bytes_exact);
+    }
+
+    #[test]
+    fn backend_previews_are_bounded_and_redacted_when_tool_logging_is_off() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = default_config(root.path().to_path_buf());
+        config.api_key = Some("backend-preview-secret".to_string());
+        assert_eq!(config.tool_logging.mode, ToolLogMode::Off);
+
+        let request = backend_request_preview(
+            &config,
+            &json!({
+                "cmd": "echo backend-preview-secret",
+                "padding": "x".repeat(1_000),
+            }),
+            None,
+            128,
+        );
+        assert!(!request.contains("backend-preview-secret"));
+        assert!(request.len() <= 128);
+
+        let result = ToolResult::text("backend-preview-secret visible tail")
+            .with_structured(json!({"output":"backend-preview-secret"}));
+        let response = backend_response_preview(&config, &result, 128);
+        assert!(!response.contains("backend-preview-secret"));
+        assert!(response.len() <= 128);
     }
 
     #[test]
