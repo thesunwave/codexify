@@ -29,7 +29,7 @@ impl Tool for GetAgentBrief {
     }
 
     fn description(&self) -> String {
-        "Returns the generated operating brief for this workspace, including workspace guidance, host OS and shell, working directory, command policy, and project AGENTS.md rules. The same brief is also exposed through the server's MCP instructions.".into()
+        "Returns the generated operating brief for this workspace, including workspace guidance, host OS and shell, working directory, command policy, and project AGENTS.md rules. The same brief is also exposed through the server's MCP instructions. Read once per conversation/workspace; repeat after a workspace change or context compaction that dropped the previous brief.".into()
     }
 
     fn input_schema(&self) -> Value {
