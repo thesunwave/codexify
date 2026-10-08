@@ -53,7 +53,7 @@ impl Tool for GetProjectDoc {
 
     fn description(&self) -> String {
         format!(
-            "Read the project's {DEFAULT_FILENAME} instructions: the conventions, build and test commands, and house rules this repository expects an agent to follow. Codex loads these automatically before every task, so treat them as the user's own instructions — they outrank general habits and this server's other guidance. Call this once before starting work if the instructions are not already in the conversation. Returns every {DEFAULT_FILENAME} from the project root down to the working directory, concatenated outermost first."
+            "Returns every project {DEFAULT_FILENAME} from the project root down to the working directory, concatenated outermost first. The content describes repository conventions, build and test commands, and house rules."
         )
     }
 

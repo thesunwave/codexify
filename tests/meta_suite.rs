@@ -165,6 +165,43 @@ fn all_tools_have_required_fields() {
     validate_and_wrap_tools(load_tools()).expect("all static tool contracts must validate");
 }
 
+#[test]
+fn shell_hot_path_tool_descriptions_are_declarative() {
+    let config = default_config(PathBuf::from("/tmp"));
+    let guarded = [
+        "exec_command",
+        "write_stdin",
+        "get_environment",
+        "get_project_doc",
+        "get_agent_brief",
+    ];
+    let imperative_fragments = [
+        "call this",
+        "use this",
+        "read this first",
+        "follow what",
+        "pass that",
+        "always ",
+        "do not ",
+        "never ",
+    ];
+
+    for tool in load_tools() {
+        if !guarded.contains(&tool.name()) {
+            continue;
+        }
+
+        let description = tool.describe(&config).to_ascii_lowercase();
+        for fragment in imperative_fragments {
+            assert!(
+                !description.contains(fragment),
+                "{} description contains imperative fragment {fragment:?}: {description}",
+                tool.name()
+            );
+        }
+    }
+}
+
 fn assert_nested_object_schemas_are_closed(schema: &Value, tool: &str, path: &str) {
     match schema {
         Value::Object(object) => {

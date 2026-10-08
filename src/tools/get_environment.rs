@@ -29,7 +29,7 @@ impl Tool for GetEnvironment {
     }
 
     fn description(&self) -> String {
-        "Report the machine this bridge is running on: operating system, the shell exec_command will use, the working directory, and the concurrent-session limit. Command execution is unrestricted. Call this before writing any shell command — the same command string behaves differently under PowerShell, cmd and POSIX sh, and guessing wrong wastes a turn.".into()
+        "Returns metadata about the machine hosting this bridge: operating system, the shell used by exec_command, the working directory, and the command policy.".into()
     }
 
     fn input_schema(&self) -> Value {

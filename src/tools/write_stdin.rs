@@ -45,7 +45,7 @@ impl Tool for WriteStdin {
     }
 
     fn description(&self) -> String {
-        "Writes characters to an existing exec_command session and returns recent output. Use this to answer a prompt from an interactive command, feed input to a REPL, or simply poll a still-running process for more output.\n\nPass the session_id returned by exec_command. Leave chars empty to poll without writing. Include a trailing newline in chars when the process is waiting for a line of input. Send a lone \\u0003 (Ctrl-C) to interrupt a runaway or blocking process. When the process exits, the response carries exit_code instead of session_id and the session is discarded.".into()
+        "Writes characters to an existing exec_command session and returns recent output. session_id identifies the running session. An empty chars value polls without writing; a trailing newline submits a line to a process waiting for line input; a lone \\u0003 (Ctrl-C) interrupts the process. When the process exits, the response contains exit_code instead of session_id and the session is discarded.".into()
     }
 
     fn input_schema(&self) -> Value {
