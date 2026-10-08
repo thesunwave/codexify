@@ -391,6 +391,18 @@ fn advertised_tool(tool: &dyn Tool, config: &AppConfig) -> rmcp::model::Tool {
     if config.multi_project && !app_only_tool(tool) {
         fields.push((WORKSPACE_CHANGE_FIELD, WORKSPACE_CHANGE_DESCRIPTION));
     }
+    if config.experimental.chatgpt_bridge
+        && !app_only_tool(tool)
+        && !matches!(
+            tool.name(),
+            "chatgpt_backend_attach" | "chatgpt_backend_exchange"
+        )
+    {
+        fields.push((
+            crate::chatgpt_backend::CONTROL_FIELD,
+            crate::chatgpt_backend::CONTROL_DESCRIPTION,
+        ));
+    }
     let output = if fields.is_empty() {
         tool.output_schema()
     } else {
@@ -781,6 +793,49 @@ impl ServerHandler for CodexHandler {
             .flatten()
             .filter(|value| !value.is_empty() && value.len() <= 64)
             .map(str::to_owned);
+        let backend_active_task = if self.config.experimental.chatgpt_bridge
+            && model_call
+            && !matches!(
+                name.as_str(),
+                "chatgpt_backend_attach" | "chatgpt_backend_exchange"
+            )
+            && let Some(identity) = task_conversation.as_ref()
+        {
+            match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config) {
+                Ok(store) => match store.active_task_for_worker(identity.stable_key()) {
+                    Ok(Some((session_id, task_seq, workspace))) => {
+                        let activity_seq = match store.start_tool_activity(
+                            &session_id,
+                            task_seq,
+                            &name,
+                        ) {
+                            Ok(seq) => Some(seq),
+                            Err(error) => {
+                                tracing::warn!(%error, tool = %name, "could not record ChatGPT backend tool start");
+                                None
+                            }
+                        };
+                        Some((store, session_id, activity_seq, workspace))
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not inspect active ChatGPT backend task");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "could not inspect active ChatGPT backend task");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tool_cancellation = if backend_active_task.is_some() {
+            context.ct.child_token()
+        } else {
+            context.ct.clone()
+        };
         let tool_context = ToolRequestContext {
             conversation: conversation.clone(),
             task_conversation: task_conversation.clone(),
@@ -794,7 +849,7 @@ impl ServerHandler for CodexHandler {
             project_bindings: self.project_bindings.clone(),
             diff_checkpoints: self.diff_checkpoints.clone(),
             artifact_egress: self.artifact_egress.clone(),
-            cancellation: context.ct.clone(),
+            cancellation: tool_cancellation.clone(),
         };
 
         // Keep `tool` as an Option so that even an unknown-tool call flows through
@@ -806,14 +861,22 @@ impl ServerHandler for CodexHandler {
         let authorized_before = self
             .conversation_auth_error("chat_read", conversation.as_ref())
             .is_none();
+        let backend_workspace_root = backend_active_task
+            .as_ref()
+            .and_then(|(_, _, _, workspace)| workspace.as_ref())
+            .map(|workspace| std::path::PathBuf::from(&workspace.active_root));
         let workspace_at_start = if model_call && authorized_before {
-            match task_conversation.as_ref() {
-                Some(identity) => {
-                    self.project_bindings
-                        .dispatch_workspace(&self.config, identity)
-                        .await
+            if let Some(root) = backend_workspace_root {
+                Ok((Some(root), None))
+            } else {
+                match task_conversation.as_ref() {
+                    Some(identity) => {
+                        self.project_bindings
+                            .dispatch_workspace(&self.config, identity)
+                            .await
+                    }
+                    None => self.session.dispatch_workspace(&self.config).await,
                 }
-                None => self.session.dispatch_workspace(&self.config).await,
             }
         } else {
             Ok((None, None))
@@ -879,6 +942,35 @@ impl ServerHandler for CodexHandler {
                 "tool arguments summarized"
             );
         }
+
+        let backend_cancel_watch = if let Some((store, _, _, _)) = backend_active_task.as_ref()
+            && let Some(identity) = task_conversation.as_ref()
+        {
+            let store = store.clone();
+            let worker = identity.stable_key().to_string();
+            let cancellation = tool_cancellation.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    if cancellation.is_cancelled() {
+                        return;
+                    }
+                    match store.pending_cancel_for_worker(&worker) {
+                        Ok(Some(_)) => {
+                            cancellation.cancel();
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "could not inspect ChatGPT backend cancellation queue");
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }))
+        } else {
+            None
+        };
 
         let started = Instant::now();
         let mut result = if let Some(error) =
@@ -1282,7 +1374,22 @@ impl ServerHandler for CodexHandler {
             }
         }
 
+        if let Some(watch) = backend_cancel_watch {
+            watch.abort();
+        }
         let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if let Some((store, session_id, Some(activity_seq), _)) = backend_active_task.as_ref() {
+            let status = if tool_cancellation.is_cancelled() {
+                crate::chatgpt_backend::BackendToolActivityStatus::Cancelled
+            } else if result.is_error {
+                crate::chatgpt_backend::BackendToolActivityStatus::Failed
+            } else {
+                crate::chatgpt_backend::BackendToolActivityStatus::Succeeded
+            };
+            if let Err(error) = store.complete_tool_activity(session_id, *activity_seq, status) {
+                tracing::warn!(%error, tool = %name, "could not record ChatGPT backend tool completion");
+            }
+        }
         widget_debug::attach_configured_tool_timing(&self.config, &mut result, &name, duration_ms);
         if let (Some(logger), Some(call)) = (&self.tool_logging, tool_log_call.as_ref()) {
             logger.finish(call, &call_identity, &result, duration_ms);
@@ -1334,6 +1441,42 @@ impl ServerHandler for CodexHandler {
                 crate::markdown_chat::USER_MESSAGE_FIELD,
                 result.new_chat_message_from_user.take(),
             ));
+        }
+        if self.config.experimental.chatgpt_bridge
+            && model_call
+            && !matches!(
+                name.as_str(),
+                "chatgpt_backend_attach" | "chatgpt_backend_exchange"
+            )
+            && let Some(identity) = task_conversation.as_ref()
+        {
+            match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config)
+                .and_then(|store| store.pending_control_for_worker(identity.stable_key()))
+            {
+                Ok(Some((session_id, command))) => {
+                    let required_action = match command.kind {
+                        crate::chatgpt_backend::BackendCommandKind::Steer => {
+                            "apply_steer_then_ack_control"
+                        }
+                        crate::chatgpt_backend::BackendCommandKind::Cancel => {
+                            "stop_active_task_then_ack_control_and_report_error"
+                        }
+                        _ => unreachable!("only steer/cancel are injected into tool results"),
+                    };
+                    let control = serde_json::to_string(&json!({
+                        "session_id": session_id,
+                        "command": command,
+                        "required_action": required_action,
+                    }))
+                    .expect("ChatGPT backend control envelope is serializable");
+                    output_fields.push((crate::chatgpt_backend::CONTROL_FIELD, Some(control)));
+                }
+                Ok(None) => output_fields.push((crate::chatgpt_backend::CONTROL_FIELD, None)),
+                Err(error) => {
+                    tracing::warn!(%error, "could not inspect ChatGPT backend control queue");
+                    output_fields.push((crate::chatgpt_backend::CONTROL_FIELD, None));
+                }
+            }
         }
         if !context.ct.is_cancelled()
             && let Some((chat, end)) = delivery
@@ -1507,6 +1650,8 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         }
     }
     let config = Arc::new(config);
+    // Keep the privileged local controller alive for the entire MCP server lifetime.
+    let _chatgpt_backend_controller = crate::chatgpt_backend_controller::spawn(config.clone())?;
 
     // Connect to any configured upstream MCP servers and merge their tools in.
     // The returned services must stay alive for the whole server lifetime, so
@@ -3257,6 +3402,28 @@ mod tests {
 
         assert!(builtin_ui_resources(false).is_empty());
         assert!(builtin_ui_contents(false, crate::setup_ui::SETUP_UI_URI).is_none());
+    }
+
+    #[test]
+    fn chatgpt_backend_control_is_advertised_only_on_ordinary_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(root.path().to_path_buf());
+        config.experimental.chatgpt_bridge = true;
+        let ordinary = advertised_tool(&crate::tools::get_environment::GetEnvironment, &config);
+        assert!(ordinary.output_schema.as_ref().is_some_and(|schema| {
+            schema["properties"]
+                .get(crate::chatgpt_backend::CONTROL_FIELD)
+                .is_some()
+        }));
+        let backend = advertised_tool(
+            &crate::tools::chatgpt_backend::ChatGptBackendTool::Exchange,
+            &config,
+        );
+        assert!(backend.output_schema.as_ref().is_some_and(|schema| {
+            schema["properties"]
+                .get(crate::chatgpt_backend::CONTROL_FIELD)
+                .is_none()
+        }));
     }
 
     #[test]

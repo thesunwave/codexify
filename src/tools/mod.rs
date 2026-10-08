@@ -1,6 +1,8 @@
 //! Tool implementations. Each file is one Codex-style MCP tool.
 
 pub mod apply_patch;
+pub mod chatgpt_backend;
+pub mod chatgpt_bridge;
 pub mod check_for_updates;
 pub mod clock_curr_time;
 pub mod clock_sleep;

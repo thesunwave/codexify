@@ -40,6 +40,17 @@ pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
         config.markdown_chat.enabled,
         config.artifact_ingress.max_concurrent_downloads,
     );
+    if config.experimental.chatgpt_bridge {
+        tools.push(Box::new(tools::chatgpt_backend::ChatGptBackendTool::Attach));
+        tools.push(Box::new(
+            tools::chatgpt_backend::ChatGptBackendTool::Exchange,
+        ));
+        if config.ui_widgets {
+            tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Worker));
+            tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Submit));
+            tools.push(Box::new(tools::chatgpt_bridge::ChatGptBridgeTool::Next));
+        }
+    }
     if config.markdown_chat.enabled && config.ui_widgets {
         tools.push(Box::new(tools::markdown_chat_ui::ChatUiTool::Send));
         tools.push(Box::new(tools::markdown_chat_ui::ChatUiTool::State));

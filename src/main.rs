@@ -6,8 +6,9 @@ use serde::Serialize;
 
 use anyhow::Context;
 use codexify::config::{
-    Cli, CliCommand, ProjectsCommand, ProjectsListArgs, ServiceCommand, config_path_for_quickstart,
-    config_path_for_service, load_config, load_project_catalog_for_cli,
+    ChatGptBackendCommand, ChatGptBridgeCommand, Cli, CliCommand, ProjectsCommand,
+    ProjectsListArgs, ServiceCommand, config_path_for_quickstart, config_path_for_service,
+    load_config, load_config_quiet, load_project_catalog_for_cli,
 };
 use codexify::doctor;
 use codexify::legacy_migration;
@@ -25,6 +26,54 @@ struct CliProjectListOutput {
     #[serde(flatten)]
     list: ProjectListOutput,
     diagnostics: Vec<ProjectCatalogDiagnostic>,
+}
+
+fn write_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    codexify::terminal::write_stdout(&format!("{}\n", serde_json::to_string(value)?))?;
+    Ok(())
+}
+
+async fn run_chatgpt_backend(cli: Cli, command: ChatGptBackendCommand) -> anyhow::Result<()> {
+    use std::time::Duration;
+    let config = load_config_quiet(cli).map_err(anyhow::Error::msg)?;
+    let adapter =
+        codexify::chatgpt_backend_adapter::ChatGptBackendAdapter::for_current_user(&config)
+            .map_err(anyhow::Error::new)?;
+    match command {
+        ChatGptBackendCommand::Sessions => write_json(&adapter.sessions()?),
+        ChatGptBackendCommand::Acquire(args) => {
+            write_json(&adapter.acquire(args.workspace.as_deref())?)
+        }
+        ChatGptBackendCommand::Status(args) => write_json(&adapter.status(&args.session_id)?),
+        ChatGptBackendCommand::Submit(args) => {
+            write_json(&adapter.submit_task(&args.session_id, args.prompt)?)
+        }
+        ChatGptBackendCommand::Run(args) => {
+            write_json(&adapter.run(&args.session_id, &args.run_id)?)
+        }
+        ChatGptBackendCommand::Wait(args) => write_json(
+            &adapter
+                .wait_run(
+                    &args.session_id,
+                    &args.run_id,
+                    Duration::from_secs(args.timeout_seconds),
+                )
+                .await?,
+        ),
+        ChatGptBackendCommand::Steer(args) => {
+            write_json(&adapter.steer(&args.session_id, &args.run_id, args.instruction)?)
+        }
+        ChatGptBackendCommand::Cancel(args) => {
+            write_json(&adapter.cancel(&args.session_id, &args.run_id, args.reason)?)
+        }
+        ChatGptBackendCommand::Drain(args) => {
+            write_json(&adapter.drain(&args.session_id, Some(args.reason))?)
+        }
+        ChatGptBackendCommand::Abandon(args) => {
+            write_json(&adapter.abandon(&args.session_id, Some(args.reason))?)
+        }
+        ChatGptBackendCommand::Finish(args) => write_json(&adapter.finish(&args.session_id)?),
+    }
 }
 
 fn source_name(source: ProjectSource) -> &'static str {
@@ -166,6 +215,26 @@ async fn main() {
 async fn run(mut cli: Cli) -> anyhow::Result<()> {
     if let Some(command) = cli.command.take() {
         match command {
+            CliCommand::ChatGptBridge { command } => {
+                let config = load_config_quiet(cli).map_err(anyhow::Error::msg)?;
+                return match command {
+                    ChatGptBridgeCommand::Ask(args) => {
+                        codexify::chatgpt_bridge::run_ask_cli(&config, args).await
+                    }
+                    ChatGptBridgeCommand::Sessions(args) => {
+                        codexify::chatgpt_backend::run_sessions_cli(&config, args)
+                    }
+                    ChatGptBridgeCommand::Send(args) => {
+                        codexify::chatgpt_backend::run_send_cli(&config, args)
+                    }
+                    ChatGptBridgeCommand::Status(args) => {
+                        codexify::chatgpt_backend::run_status_cli(&config, args)
+                    }
+                };
+            }
+            CliCommand::ChatGptBackend { command } => {
+                return run_chatgpt_backend(cli, command).await;
+            }
             CliCommand::Chat => {
                 println!("{}", codexify::owner_chat::dashboard_url().await?);
                 return Ok(());

@@ -30,6 +30,122 @@ use crate::types::{
 };
 use crate::util::home_dir;
 
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSessionsArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSendArgs {
+    pub session_id: String,
+    pub content: Option<String>,
+    #[arg(long, default_value = "task")]
+    pub kind: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendStatusArgs {
+    pub session_id: String,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub timeline: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBridgeAskArgs {
+    pub prompt: String,
+    #[arg(long, default_value_t = 180)]
+    pub timeout_seconds: u64,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChatGptBridgeCommand {
+    Ask(ChatGptBridgeAskArgs),
+    Sessions(ChatGptBackendSessionsArgs),
+    Send(ChatGptBackendSendArgs),
+    Status(ChatGptBackendStatusArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ChatGptBackendCommand {
+    Sessions,
+    Acquire(ChatGptBackendAcquireArgs),
+    Status(ChatGptBackendControllerSessionArgs),
+    Submit(ChatGptBackendSubmitArgs),
+    Run(ChatGptBackendRunArgs),
+    Wait(ChatGptBackendWaitArgs),
+    Steer(ChatGptBackendSteerArgs),
+    Cancel(ChatGptBackendCancelArgs),
+    Drain(ChatGptBackendDrainArgs),
+    Abandon(ChatGptBackendAbandonArgs),
+    Finish(ChatGptBackendControllerSessionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendAcquireArgs {
+    #[arg(long)]
+    pub workspace: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendControllerSessionArgs {
+    pub session_id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSubmitArgs {
+    pub session_id: String,
+    pub prompt: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendRunArgs {
+    pub session_id: String,
+    pub run_id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendWaitArgs {
+    pub session_id: String,
+    pub run_id: String,
+    #[arg(long, default_value_t = 300)]
+    pub timeout_seconds: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendSteerArgs {
+    pub session_id: String,
+    pub run_id: String,
+    pub instruction: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendCancelArgs {
+    pub session_id: String,
+    pub run_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendDrainArgs {
+    pub session_id: String,
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ChatGptBackendAbandonArgs {
+    pub session_id: String,
+    #[arg(long)]
+    pub reason: String,
+}
+
 pub const CODEXIFY_CONFIG_ENV: &str = "CODEXIFY_CONFIG";
 const CONFIG_FILE_NAME: &str = "codexify.config.json";
 const CONFIG_HOME_DIR: &str = ".codexify";
@@ -175,6 +291,16 @@ pub enum CliCommand {
     Config(ConfigArgs),
     /// Diagnose the local Codexify installation without changing it.
     Doctor(DoctorArgs),
+    #[command(name = "chatgpt-bridge")]
+    ChatGptBridge {
+        #[command(subcommand)]
+        command: ChatGptBridgeCommand,
+    },
+    #[command(name = "chatgpt-backend")]
+    ChatGptBackend {
+        #[command(subcommand)]
+        command: ChatGptBackendCommand,
+    },
     /// Inspect the read-only project catalogue used by multi-project mode.
     Projects {
         #[command(subcommand)]
@@ -589,6 +715,10 @@ impl PartialMcpServerSpec {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PartialExperimental {
     agent_tickets: Option<bool>,
+    chatgpt_bridge: Option<bool>,
+    chatgpt_backend_controller_socket: Option<String>,
+    chatgpt_backend_controller_allowed_uid: Option<u32>,
+    chatgpt_backend_delegated_roots: Option<Vec<String>>,
     force_read_only_tool_annotations: Option<bool>,
     claude_skills: Option<bool>,
 }
@@ -1656,12 +1786,44 @@ fn load_config_with_announcements(
     }
 
     let experimental = file.experimental.unwrap_or_default();
+    let controller_socket = experimental
+        .chatgpt_backend_controller_socket
+        .map(std::path::PathBuf::from);
+    if controller_socket
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("experimental.chatgptBackendControllerSocket must be an absolute path".into());
+    }
+    if experimental
+        .chatgpt_backend_controller_allowed_uid
+        .is_some()
+        && controller_socket.is_none()
+    {
+        return Err("experimental.chatgptBackendControllerAllowedUid requires experimental.chatgptBackendControllerSocket".into());
+    }
+    let delegated_roots = experimental
+        .chatgpt_backend_delegated_roots
+        .unwrap_or_default()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    if delegated_roots.iter().any(|path| !path.is_absolute()) {
+        return Err(
+            "experimental.chatgptBackendDelegatedRoots entries must be absolute paths".into(),
+        );
+    }
     let config = AppConfig {
         work_dir,
         debug: file.debug.unwrap_or(false),
         ui_widgets: file.ui_widgets.unwrap_or(true),
         experimental: ExperimentalConfig {
             agent_tickets: experimental.agent_tickets.unwrap_or(false),
+            chatgpt_bridge: experimental.chatgpt_bridge.unwrap_or(false),
+            chatgpt_backend_controller_socket: controller_socket,
+            chatgpt_backend_controller_allowed_uid: experimental
+                .chatgpt_backend_controller_allowed_uid,
+            chatgpt_backend_delegated_roots: delegated_roots,
             force_read_only_tool_annotations: experimental
                 .force_read_only_tool_annotations
                 .or(file.force_read_only_tool_annotations)
@@ -2015,6 +2177,53 @@ mod tests {
         assert!(
             serde_json::from_str::<FileConfig>(r#"{"experimental":{"agentTickets":"true"}}"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn chatgpt_backend_config_survives_v1_7_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let socket = root.path().join("controller.sock");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "workDir": root.path(),
+                "codexMcp": {"enabled": false},
+                "experimental": {
+                    "chatgptBridge": true,
+                    "chatgptBackendControllerSocket": socket,
+                    "chatgptBackendControllerAllowedUid": 503,
+                    "chatgptBackendDelegatedRoots": [root.path()]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config = load_config(cli(root.path(), &path)).unwrap();
+        assert!(config.experimental.chatgpt_bridge);
+        assert_eq!(
+            config.experimental.chatgpt_backend_controller_socket,
+            Some(socket)
+        );
+        assert_eq!(
+            config.experimental.chatgpt_backend_controller_allowed_uid,
+            Some(503)
+        );
+        assert_eq!(
+            config.experimental.chatgpt_backend_delegated_roots,
+            vec![root.path()]
+        );
+
+        let invalid = serde_json::json!({
+            "workDir": root.path(),
+            "experimental": {"chatgptBackendControllerSocket": "relative.sock"}
+        });
+        std::fs::write(&path, invalid.to_string()).unwrap();
+        assert!(
+            load_config(cli(root.path(), &path))
+                .unwrap_err()
+                .contains("must be an absolute path")
         );
     }
 

@@ -1,0 +1,243 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; padding: 10px 12px; background: transparent; color: CanvasText; }
+    .card { display: flex; align-items: center; gap: 10px; min-height: 36px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: GrayText; flex: 0 0 auto; }
+    .dot.live { background: #2e9b50; }
+    .dot.busy { background: #b87a00; }
+    .dot.error { background: #c43d3d; }
+    .copy { min-width: 0; flex: 1; }
+    .title { font-size: 13px; font-weight: 650; line-height: 1.25; }
+    .detail { margin-top: 2px; color: GrayText; font-size: 12px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <div class="card" role="status" aria-live="polite">
+    <div id="dot" class="dot"></div>
+    <div class="copy">
+      <div id="title" class="title">Codexify ChatGPT worker</div>
+      <div id="detail" class="detail">Connecting…</div>
+    </div>
+  </div>
+<script>
+(() => {
+  const POLL_MS = 1000;
+  const TOOL_TIMEOUT_MS = 8000;
+  let nextId = 1;
+  let initialized = false;
+  let tornDown = false;
+  let timer = null;
+  const pending = new Map();
+
+  const dot = document.getElementById("dot");
+  const title = document.getElementById("title");
+  const detail = document.getElementById("detail");
+
+  function render(state, text) {
+    dot.className = `dot${state === "idle" ? " live" : state === "busy" ? " busy" : state === "error" ? " error" : ""}`;
+    title.textContent = state === "busy" ? "Codexify ChatGPT worker · busy" : state === "error" ? "Codexify ChatGPT worker · error" : "Codexify ChatGPT worker";
+    detail.textContent = text;
+    reportSize();
+  }
+
+  function post(message) {
+    window.parent.postMessage({ jsonrpc: "2.0", ...message }, "*");
+  }
+
+  function request(method, params, timeoutMs = TOOL_TIMEOUT_MS) {
+    const id = nextId++;
+    post({ id, method, params });
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error("The ChatGPT host did not respond."));
+      }, timeoutMs);
+      pending.set(id, { resolve, reject, timeout });
+    });
+  }
+
+  function notify(method, params) {
+    post({ method, params });
+  }
+
+  function reportSize() {
+    if (!initialized || tornDown) return;
+    notify("ui/notifications/size-changed", {
+      width: document.documentElement.clientWidth,
+      height: document.documentElement.scrollHeight
+    });
+  }
+
+  function objectFrom(value, selector) {
+    const queue = [value];
+    const seen = new Set();
+    const nested = ["_meta", "meta", "result", "call_tool_result", "callToolResult", "mcp_tool_result", "mcpToolResult", "toolOutput", "toolResponseMetadata"];
+    while (queue.length) {
+      const candidate = queue.shift();
+      if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
+      seen.add(candidate);
+      const selected = selector(candidate);
+      if (selected) return selected;
+      for (const key of nested) {
+        if (candidate[key] && typeof candidate[key] === "object") queue.push(candidate[key]);
+      }
+    }
+    return null;
+  }
+
+  function toolFailure(value) {
+    return objectFrom(value, candidate => {
+      if (candidate.isError !== true && candidate.is_error !== true) return null;
+      const content = Array.isArray(candidate.content) ? candidate.content : [];
+      return content.map(part => typeof part?.text === "string" ? part.text : "").filter(Boolean).join("\n") || "The bridge tool call failed.";
+    });
+  }
+
+  function bridgePayload(value) {
+    return objectFrom(value, candidate => {
+      const structured = candidate.structuredContent || candidate.structured_content;
+      if (structured && typeof structured.state === "string") return structured;
+      if (typeof candidate.state === "string") return candidate;
+      return null;
+    });
+  }
+
+  async function callTool(name, args) {
+    let result;
+    if (initialized) {
+      try {
+        result = await request("tools/call", { name, arguments: args || {} });
+      } catch (error) {
+        if (typeof window.openai?.callTool !== "function") throw error;
+      }
+    }
+    if (result === undefined && typeof window.openai?.callTool === "function") {
+      result = await window.openai.callTool(name, args || {});
+    }
+    if (result === undefined) throw new Error("This host does not expose widget tool calls.");
+    const failure = toolFailure(result);
+    if (failure) throw new Error(failure);
+    return result;
+  }
+
+  async function sendMessage(prompt) {
+    if (initialized) {
+      try {
+        const result = await request("ui/message", {
+          role: "user",
+          content: [{ type: "text", text: prompt }]
+        });
+        if (result?.isError === true || result?.is_error === true) throw new Error("The host rejected the follow-up message.");
+        return;
+      } catch (error) {
+        if (typeof window.openai?.sendFollowUpMessage !== "function") throw error;
+      }
+    }
+    if (typeof window.openai?.sendFollowUpMessage === "function") {
+      const result = await window.openai.sendFollowUpMessage({ prompt, scrollToBottom: false });
+      if (result?.isError === true || result?.is_error === true) throw new Error("The host rejected the follow-up message.");
+      return;
+    }
+    throw new Error("This host does not support component-authored follow-up messages.");
+  }
+
+  function workerPrompt(requestId, prompt) {
+    return [
+      "You are processing an external Codexify ChatGPT bridge request.",
+      "",
+      `Request ID: ${requestId}`,
+      "",
+      "External request:",
+      prompt,
+      "",
+      "Complete the request using the capabilities available in this ChatGPT conversation.",
+      "Before ending this turn, ALWAYS call `chatgpt_bridge_submit_result` exactly once with this request_id.",
+      "Use status `completed` and put the final answer in `result`; if the request cannot be completed, use status `failed` and put a concise explanation in `result`.",
+      "Do not invent or change the request_id. Do not finish the turn before the tool call succeeds."
+    ].join("\n");
+  }
+
+  async function poll() {
+    if (tornDown) return;
+    try {
+      const raw = await callTool("chatgpt_bridge_next", {});
+      const payload = bridgePayload(raw);
+      if (!payload) throw new Error("Bridge returned no structured worker state. Refresh connector tools.");
+      if (payload.state === "claimed") {
+        if (!payload.request_id || !payload.prompt) throw new Error("Claimed request is incomplete.");
+        render("busy", `Dispatching ${payload.request_id} to ChatGPT…`);
+        await sendMessage(workerPrompt(payload.request_id, payload.prompt));
+        render("busy", `Waiting for ChatGPT to submit ${payload.request_id}…`);
+      } else if (payload.state === "busy") {
+        render("busy", payload.request_id ? `Waiting for ${payload.request_id}…` : "Waiting for the current request…");
+      } else {
+        render("idle", "Connected · waiting for local requests");
+      }
+    } catch (error) {
+      render("error", String(error?.message || error || "Unknown bridge error").replace(/\s+/g, " ").slice(0, 300));
+    } finally {
+      if (!tornDown) timer = setTimeout(poll, POLL_MS);
+    }
+  }
+
+  window.addEventListener("message", event => {
+    if (event.source !== window.parent) return;
+    const message = event.data;
+    if (!message || message.jsonrpc !== "2.0") return;
+    if (Object.prototype.hasOwnProperty.call(message, "result") || Object.prototype.hasOwnProperty.call(message, "error")) {
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id);
+      clearTimeout(waiter.timeout);
+      if (message.error) waiter.reject(new Error(message.error.message || "Host request failed."));
+      else waiter.resolve(message.result);
+      return;
+    }
+    if (message.method === "ui/resource-teardown") {
+      tornDown = true;
+      clearTimeout(timer);
+      for (const waiter of pending.values()) {
+        clearTimeout(waiter.timeout);
+        waiter.reject(new Error("Worker widget closed."));
+      }
+      pending.clear();
+      if (message.id !== undefined) post({ id: message.id, result: {} });
+    }
+  });
+
+  window.addEventListener("pagehide", () => {
+    tornDown = true;
+    clearTimeout(timer);
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timeout);
+      waiter.reject(new Error("Worker widget closed."));
+    }
+    pending.clear();
+  });
+
+  request("ui/initialize", {
+    protocolVersion: "2026-01-26",
+    appInfo: { name: "codexify-chatgpt-bridge", version: "0.1.0" },
+    appCapabilities: {}
+  }).then(() => {
+    initialized = true;
+    notify("ui/notifications/initialized", {});
+    render("idle", "Connected · waiting for local requests");
+    poll();
+  }).catch(error => {
+    if (typeof window.openai?.callTool === "function" && typeof window.openai?.sendFollowUpMessage === "function") {
+      render("idle", "Connected through ChatGPT compatibility bridge · waiting for local requests");
+      poll();
+    } else {
+      render("error", String(error?.message || error || "Could not initialize MCP Apps bridge."));
+    }
+  });
+})();
+</script>
+</body>
+</html>
