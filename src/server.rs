@@ -59,7 +59,7 @@ use crate::setup_ui;
 use crate::tool::{
     Tool, ToolCallIdentity, ToolRequestContext, validate_and_wrap_tool, validate_and_wrap_tools,
 };
-use crate::tool_logging::ToolCallLogger;
+use crate::tool_logging::{ToolCallLogger, backend_request_preview, backend_response_preview};
 use crate::tools::continuation::{ContinueTask, PrepareContinuation};
 use crate::tools::set_project_root::{
     ProjectSelection, ProjectSelectionRequest, SetProjectRoot, select_and_render,
@@ -72,6 +72,8 @@ const HTTP_SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 // so modern clients may store these responses but must consider them stale at once.
 const DEFAULT_CACHE_TTL_MS: u64 = 0;
 const WORKSPACE_CHANGE_FIELD: &str = "workspace_changed";
+const CHATGPT_BACKEND_REQUEST_PREVIEW_BYTES: usize = 4 * 1024;
+const CHATGPT_BACKEND_RESPONSE_PREVIEW_BYTES: usize = 8 * 1024;
 const WORKSPACE_CHANGE_DESCRIPTION: &str = "User-selected workspace transition. Stop using old paths and call get_agent_brief before further project work. Omitted when no transition is pending.";
 
 fn should_emit_ordinary_tool_completion(
@@ -804,10 +806,18 @@ impl ServerHandler for CodexHandler {
             match crate::chatgpt_backend::ChatGptBackendStore::for_current_user(&self.config) {
                 Ok(store) => match store.active_task_for_worker(identity.stable_key()) {
                     Ok(Some((session_id, task_seq, workspace))) => {
-                        let activity_seq = match store.start_tool_activity(
+                        let input_schema = tool.map(|tool| tool.input_schema());
+                        let request_preview = backend_request_preview(
+                            &self.config,
+                            &args,
+                            input_schema.as_ref(),
+                            CHATGPT_BACKEND_REQUEST_PREVIEW_BYTES,
+                        );
+                        let activity_seq = match store.start_tool_activity_with_preview(
                             &session_id,
                             task_seq,
                             &name,
+                            Some(request_preview),
                         ) {
                             Ok(seq) => Some(seq),
                             Err(error) => {
@@ -1386,7 +1396,17 @@ impl ServerHandler for CodexHandler {
             } else {
                 crate::chatgpt_backend::BackendToolActivityStatus::Succeeded
             };
-            if let Err(error) = store.complete_tool_activity(session_id, *activity_seq, status) {
+            let response_preview = backend_response_preview(
+                &self.config,
+                &result,
+                CHATGPT_BACKEND_RESPONSE_PREVIEW_BYTES,
+            );
+            if let Err(error) = store.complete_tool_activity_with_preview(
+                session_id,
+                *activity_seq,
+                status,
+                Some(response_preview),
+            ) {
                 tracing::warn!(%error, tool = %name, "could not record ChatGPT backend tool completion");
             }
         }
